@@ -794,7 +794,7 @@ def create_server(config: Config) -> Server:
 
     def _handle_export_raw_data(args: dict) -> list[TextContent]:
         capture = _get_capture(args["capture_id"])
-        output_dir = args.get("output_dir", config.output_dir)
+        output_dir = os.path.abspath(args.get("output_dir", config.output_dir))
         _ensure_output_dir()
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

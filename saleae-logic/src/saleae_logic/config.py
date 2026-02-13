@@ -1,4 +1,5 @@
 import argparse
+import os
 from dataclasses import dataclass
 
 
@@ -20,6 +21,6 @@ def parse_args() -> Config:
     return Config(
         host=args.host,
         port=args.port,
-        output_dir=args.output_dir,
+        output_dir=os.path.abspath(args.output_dir),
         log_level=args.log_level,
     )
