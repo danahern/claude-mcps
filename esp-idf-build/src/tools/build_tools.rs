@@ -77,7 +77,7 @@ impl EspIdfBuildToolHandler {
     /// Find IDF_PATH from config, env, or common locations
     fn find_idf_path(&self) -> Result<PathBuf, McpError> {
         // 1. Config
-        if let Some(path) = &self.config.idf.idf_path {
+        if let Some(path) = &self.config.idf_path {
             if path.exists() {
                 return Ok(path.clone());
             }
@@ -224,7 +224,7 @@ impl EspIdfBuildToolHandler {
             ));
         }
 
-        if let Some(path) = &self.config.idf.projects_dir {
+        if let Some(path) = &self.config.projects_dir {
             if path.exists() {
                 return Ok(path.clone());
             }
@@ -278,7 +278,7 @@ impl EspIdfBuildToolHandler {
     fn get_port(&self, override_port: Option<&str>) -> Option<String> {
         override_port
             .map(|s| s.to_string())
-            .or_else(|| self.config.idf.default_port.clone())
+            .or_else(|| self.config.default_port.clone())
     }
 }
 

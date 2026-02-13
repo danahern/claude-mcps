@@ -89,7 +89,7 @@ impl ZephyrBuildToolHandler {
         }
 
         // 2. Check config
-        if let Some(path) = &self.config.workspace.path {
+        if let Some(path) = &self.config.workspace_path {
             if path.exists() {
                 return Ok(path.clone());
             }
@@ -126,7 +126,7 @@ impl ZephyrBuildToolHandler {
 
     /// Get apps directory path
     fn get_apps_dir(&self, workspace: &Path) -> PathBuf {
-        workspace.join(&self.config.workspace.apps_dir)
+        workspace.join(&self.config.apps_dir)
     }
 
     /// Find app path (handles both name and full path)
