@@ -263,6 +263,40 @@ This plan will be updated as implementation progresses:
 
 ---
 
+## Testing
+
+### Running Tests
+
+```bash
+cd claude-mcps/embedded-probe && cargo test
+```
+
+All tests run without hardware connected.
+
+### Test Coverage (14 tests)
+
+**Library tests** (`src/` — 3 tests):
+- `test_probe_type_support` — Probe type support detection
+- `test_valid_rtt_address` — RTT address ELF parsing
+- `test_list_probes` — Probe discovery returns Ok
+
+**Unit tests** (`src/main.rs` — 2 tests):
+- `test_default_config` — Default CLI config
+- `test_args_parsing` — CLI args parsing
+
+**Integration tests** (`tests/integration_tests.rs` — 9 tests):
+- `test_config_validation` — Config validates and serializes to TOML
+- `test_probe_discovery` — `list_probes` returns Ok (empty list without hardware)
+- `test_error_types` — Error display strings for ProbeNotFound, SessionLimitExceeded
+- `test_probe_type_detection` — VID/PID to probe type mapping (J-Link, ST-Link, DAPLink)
+- `test_mcp_tool_handler` — Handler creation with default and custom max_sessions
+- `test_handler_with_custom_max_sessions` — Handler with boundary values (1, 100)
+- `test_config_default_values` — Default max_sessions=5, default_speed_khz=4000
+- `test_config_toml_roundtrip` — TOML output contains all config sections
+- `test_error_display` — All error variants produce non-empty display strings
+
+---
+
 ## Implementation Status
 
 **✅ COMPLETE** - All 5 new tools implemented and building:
