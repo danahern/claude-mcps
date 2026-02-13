@@ -76,3 +76,51 @@ def test_parse_args_absolute_output_dir_unchanged(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["saleae_logic", "--output-dir", "/tmp/saleae_out"])
     config = parse_args()
     assert config.output_dir == "/tmp/saleae_out"
+
+
+# ── Tool registration ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_tool_count():
+    """Server must register exactly 18 tools."""
+    config = Config()
+    server = create_server(config)
+    req = ListToolsRequest(method="tools/list")
+    result = await server.request_handlers[ListToolsRequest](req)
+    tools = result.root.tools
+    assert len(tools) == 18, f"expected 18 tools, got {len(tools)}"
+
+
+@pytest.mark.asyncio
+async def test_all_tool_names():
+    """All 18 expected tool names must be registered."""
+    expected = {
+        "get_app_info", "list_devices", "start_capture", "stop_capture",
+        "wait_capture", "close_capture", "save_capture", "load_capture",
+        "add_analyzer", "add_high_level_analyzer", "export_analyzer_data",
+        "export_raw_data", "analyze_capture", "search_protocol_data",
+        "get_timing_info", "configure_trigger", "compare_captures",
+        "stream_capture",
+    }
+    config = Config()
+    server = create_server(config)
+    req = ListToolsRequest(method="tools/list")
+    result = await server.request_handlers[ListToolsRequest](req)
+    actual = {t.name for t in result.root.tools}
+    assert actual == expected
+
+
+@pytest.mark.asyncio
+async def test_unknown_tool_returns_error():
+    """Calling an unknown tool should return an error message, not crash."""
+    config = Config()
+    server = create_server(config)
+    req = CallToolRequest(
+        method="tools/call",
+        params={"name": "nonexistent_tool", "arguments": {}},
+    )
+    result = await server.request_handlers[CallToolRequest](req)
+    content = result.root.content
+    assert len(content) == 1
+    assert "unknown tool" in content[0].text.lower()
