@@ -25,6 +25,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use zephyr_build::config::{Args, Config};
+
+    #[test]
+    fn test_args_parsing_defaults() {
+        let args = Args::parse_from(["zephyr-build"]);
+        assert!(args.workspace.is_none());
+        assert_eq!(args.log_level, "info");
+        assert!(args.log_file.is_none());
+    }
+
+    #[test]
+    fn test_args_parsing_with_workspace() {
+        let args = Args::parse_from(["zephyr-build", "--workspace", "/tmp/ws", "--log-level", "debug"]);
+        assert_eq!(args.workspace.unwrap().to_str().unwrap(), "/tmp/ws");
+        assert_eq!(args.log_level, "debug");
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = Config::default();
+        assert!(config.workspace_path.is_none());
+        assert_eq!(config.apps_dir, "zephyr-apps/apps");
+    }
+
+    #[test]
+    fn test_config_from_args() {
+        let args = Args::parse_from(["zephyr-build", "--workspace", "/tmp/ws"]);
+        let config = Config::from_args(&args);
+        assert_eq!(config.workspace_path.unwrap().to_str().unwrap(), "/tmp/ws");
+        assert_eq!(config.apps_dir, "zephyr-apps/apps");
+    }
+
+    #[test]
+    fn test_config_from_args_no_workspace() {
+        let args = Args::parse_from(["zephyr-build"]);
+        let config = Config::from_args(&args);
+        assert!(config.workspace_path.is_none());
+    }
+}
+
 fn init_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&args.log_level));

@@ -320,6 +320,45 @@ build_status(build_id="abc123")
 
 ---
 
+## Testing
+
+### Running Tests
+
+```bash
+cd claude-mcps/zephyr-build && cargo test
+```
+
+All tests run without hardware or a Zephyr workspace.
+
+### Test Coverage (19 tests)
+
+**Unit tests** (`src/main.rs` — 5 tests):
+- `test_args_parsing_defaults` — Default CLI args
+- `test_args_parsing_with_workspace` — `--workspace` and `--log-level` flags
+- `test_default_config` — `Config::default()` values
+- `test_config_from_args` — Config propagates workspace path
+- `test_config_from_args_no_workspace` — Config with no workspace
+
+**Tool tests** (`src/tools/build_tools.rs` — 9 tests):
+- `test_list_boards_common` — Returns hardcoded common boards
+- `test_list_boards_filter_nrf` — Filter returns only Nordic boards
+- `test_list_boards_filter_no_match` — Empty result for unknown filter
+- `test_list_apps_with_dummy_workspace` — Discovers apps via CMakeLists.txt
+- `test_list_apps_empty_workspace` — Empty apps dir returns empty list
+- `test_list_apps_no_apps_dir` — Missing apps dir returns error
+- `test_build_status_unknown_id` — Unknown build ID returns error
+- `test_clean_nonexistent_workspace` — Bad workspace path returns error
+- `test_clean_app_no_build_dir` — Clean succeeds when no build dir exists
+
+**Integration tests** (`tests/integration_tests.rs` — 5 tests):
+- `test_handler_creation` — Handler with default config
+- `test_handler_default` — Default trait implementation
+- `test_config_default_values` — Config field defaults
+- `test_config_from_args` — Config from CLI args
+- `test_multiple_handlers` — Multiple handler instances
+
+---
+
 ## Integration
 
 Update `claude-mcps/README.md` to include zephyr-build MCP.

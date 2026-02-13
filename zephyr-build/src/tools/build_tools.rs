@@ -535,6 +535,194 @@ impl ZephyrBuildToolHandler {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::tool::Parameters;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Extract JSON text from a CallToolResult's first content element
+    fn extract_json(result: &CallToolResult) -> serde_json::Value {
+        let text = &result.content[0].as_text().expect("expected text content").text;
+        serde_json::from_str(text).expect("expected valid JSON")
+    }
+
+    #[tokio::test]
+    async fn test_list_boards_common() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .list_boards(Parameters(ListBoardsArgs {
+                filter: None,
+                include_all: false,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let boards = parsed["boards"].as_array().unwrap();
+
+        assert!(!boards.is_empty());
+        let names: Vec<&str> = boards.iter().map(|b| b["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"nrf52840dk/nrf52840"));
+        assert!(names.contains(&"native_sim"));
+    }
+
+    #[tokio::test]
+    async fn test_list_boards_filter_nrf() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .list_boards(Parameters(ListBoardsArgs {
+                filter: Some("nrf".to_string()),
+                include_all: false,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let boards = parsed["boards"].as_array().unwrap();
+
+        assert!(!boards.is_empty());
+        for board in boards {
+            let name = board["name"].as_str().unwrap().to_lowercase();
+            let vendor = board["vendor"].as_str().unwrap_or("").to_lowercase();
+            assert!(
+                name.contains("nrf") || vendor.contains("nrf"),
+                "board {} should match 'nrf' filter",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_boards_filter_no_match() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .list_boards(Parameters(ListBoardsArgs {
+                filter: Some("nonexistent_xyz".to_string()),
+                include_all: false,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["boards"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_with_dummy_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        // Create a dummy app
+        let app = apps_dir.join("my_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(my_app)\n").unwrap();
+
+        // Create a dir without CMakeLists.txt (should be ignored)
+        fs::create_dir_all(apps_dir.join("not_an_app")).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_apps(Parameters(ListAppsArgs { workspace_path: None }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let apps = parsed["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0]["name"].as_str().unwrap(), "my_app");
+        assert!(!apps[0]["has_build"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_empty_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_apps(Parameters(ListAppsArgs { workspace_path: None }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["apps"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_no_apps_dir() {
+        let tmp = TempDir::new().unwrap();
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_apps(Parameters(ListAppsArgs { workspace_path: None }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_status_unknown_id() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .build_status(Parameters(BuildStatusArgs {
+                build_id: "nonexistent-id".to_string(),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_clean_nonexistent_workspace() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .clean(Parameters(CleanArgs {
+                app: "nonexistent_app".to_string(),
+                workspace_path: Some("/tmp/nonexistent_workspace_xyz".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_clean_app_no_build_dir() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let app = apps_dir.join("my_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(my_app)\n").unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .clean(Parameters(CleanArgs {
+                app: "my_app".to_string(),
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for ZephyrBuildToolHandler {
     fn get_info(&self) -> ServerInfo {
