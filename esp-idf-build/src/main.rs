@@ -25,6 +25,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use esp_idf_build::config::{Args, Config};
+
+    #[test]
+    fn test_args_parsing_defaults() {
+        let args = Args::parse_from(["esp-idf-build"]);
+        assert!(args.idf_path.is_none());
+        assert!(args.projects_dir.is_none());
+        assert!(args.port.is_none());
+        assert_eq!(args.log_level, "info");
+        assert!(args.log_file.is_none());
+    }
+
+    #[test]
+    fn test_args_parsing_with_options() {
+        let args = Args::parse_from([
+            "esp-idf-build",
+            "--idf-path", "/opt/esp-idf",
+            "--projects-dir", "/tmp/projects",
+            "--port", "/dev/ttyUSB0",
+            "--log-level", "debug",
+        ]);
+        assert_eq!(args.idf_path.unwrap().to_str().unwrap(), "/opt/esp-idf");
+        assert_eq!(args.projects_dir.unwrap().to_str().unwrap(), "/tmp/projects");
+        assert_eq!(args.port.unwrap(), "/dev/ttyUSB0");
+        assert_eq!(args.log_level, "debug");
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = Config::default();
+        assert!(config.idf_path.is_none());
+        assert!(config.projects_dir.is_none());
+        assert!(config.default_port.is_none());
+    }
+
+    #[test]
+    fn test_config_from_args() {
+        let args = Args::parse_from([
+            "esp-idf-build",
+            "--idf-path", "/opt/esp-idf",
+            "--port", "/dev/cu.usbserial-1110",
+        ]);
+        let config = Config::from_args(&args);
+        assert_eq!(config.idf_path.unwrap().to_str().unwrap(), "/opt/esp-idf");
+        assert_eq!(config.default_port.unwrap(), "/dev/cu.usbserial-1110");
+        assert!(config.projects_dir.is_none());
+    }
+
+    #[test]
+    fn test_config_from_args_no_options() {
+        let args = Args::parse_from(["esp-idf-build"]);
+        let config = Config::from_args(&args);
+        assert!(config.idf_path.is_none());
+        assert!(config.projects_dir.is_none());
+        assert!(config.default_port.is_none());
+    }
+}
+
 fn init_logging(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&args.log_level));

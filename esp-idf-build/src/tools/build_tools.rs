@@ -782,6 +782,134 @@ fn scan_projects(dir: &Path, base_dir: &Path, projects: &mut Vec<ProjectInfo>) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::tool::Parameters;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Extract JSON text from a CallToolResult's first content element
+    fn extract_json(result: &CallToolResult) -> serde_json::Value {
+        let text = &result.content[0].as_text().expect("expected text content").text;
+        serde_json::from_str(text).expect("expected valid JSON")
+    }
+
+    #[tokio::test]
+    async fn test_list_targets() {
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .list_targets(Parameters(ListTargetsArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let targets = parsed["targets"].as_array().unwrap();
+
+        assert!(!targets.is_empty());
+        let names: Vec<&str> = targets.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"esp32"));
+        assert!(names.contains(&"esp32s3"));
+        assert!(names.contains(&"esp32c3"));
+        assert!(names.contains(&"esp32p4"));
+    }
+
+    #[tokio::test]
+    async fn test_list_targets_has_arch() {
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .list_targets(Parameters(ListTargetsArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let targets = parsed["targets"].as_array().unwrap();
+
+        for target in targets {
+            let arch = target["arch"].as_str().unwrap();
+            assert!(
+                arch == "xtensa" || arch == "riscv",
+                "unexpected arch: {}",
+                arch
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_projects_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .list_projects(Parameters(ListProjectsArgs {
+                projects_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["projects"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_projects_with_projects() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create a dummy ESP-IDF project
+        let proj = tmp.path().join("test_project");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\ninclude($ENV{IDF_PATH}/cmake/project.cmake)\nproject(test_project)\n",
+        )
+        .unwrap();
+
+        // Create a non-project directory (no project() call)
+        let non_proj = tmp.path().join("not_a_project");
+        fs::create_dir_all(&non_proj).unwrap();
+        fs::write(
+            non_proj.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.16)\n",
+        )
+        .unwrap();
+
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .list_projects(Parameters(ListProjectsArgs {
+                projects_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let projects = parsed["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["has_build"].as_bool().unwrap(), false);
+    }
+
+    #[tokio::test]
+    async fn test_list_projects_no_dir() {
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .list_projects(Parameters(ListProjectsArgs {
+                projects_dir: Some("/tmp/nonexistent_dir_xyz".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_status_unknown_id() {
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .build_status(Parameters(BuildStatusArgs {
+                build_id: "nonexistent-id".to_string(),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+}
+
 #[tool_handler]
 impl ServerHandler for EspIdfBuildToolHandler {
     fn get_info(&self) -> ServerInfo {
