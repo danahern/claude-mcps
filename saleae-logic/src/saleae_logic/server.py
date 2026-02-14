@@ -588,6 +588,42 @@ def create_server(config: Config) -> Server:
             },
         ),
         Tool(
+            name="read_protocol_data",
+            description=(
+                "Read decoded bytes from a protocol analyzer (UART, I2C, SPI). "
+                "Returns raw hex bytes and optionally ASCII text. "
+                "For UART: extracts data bytes in order. "
+                "For I2C: extracts address and data bytes from transactions. "
+                "For SPI: extracts MOSI/MISO bytes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "capture_id": {"type": "string", "description": "Capture ID"},
+                    "analyzer_index": {
+                        "type": "integer",
+                        "description": "Analyzer index from add_analyzer",
+                    },
+                    "ascii": {
+                        "type": "boolean",
+                        "description": "Include ASCII translation (default: true)",
+                        "default": True,
+                    },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Max bytes to return (default: 4096)",
+                        "default": 4096,
+                    },
+                    "radix": {
+                        "type": "string",
+                        "description": "Number format for hex output (default: hex)",
+                        "enum": ["hex", "dec", "bin", "ascii"],
+                    },
+                },
+                "required": ["capture_id", "analyzer_index"],
+            },
+        ),
+        Tool(
             name="deep_analyze",
             description=(
                 "Statistical analysis of captured data using numpy/pandas. "
@@ -666,6 +702,8 @@ def create_server(config: Config) -> Server:
                 return _handle_compare_captures(args)
             case "stream_capture":
                 return _handle_stream_capture(args)
+            case "read_protocol_data":
+                return _handle_read_protocol_data(args)
             case "deep_analyze":
                 return _handle_deep_analyze(args)
             case _:
@@ -1211,6 +1249,222 @@ def create_server(config: Config) -> Server:
             "note": "Capture remains open. Use close_capture to release.",
         }, indent=2)
         return [TextContent(type="text", text=info)] + result
+
+    def _handle_read_protocol_data(args: dict) -> list[TextContent]:
+        auto = _get_automation()
+        capture = _get_capture(args["capture_id"])
+        handle = _get_analyzer(args["capture_id"], args["analyzer_index"])
+        include_ascii = args.get("ascii", True)
+        max_bytes = args.get("max_bytes", 4096)
+
+        radix_map = {
+            "hex": auto.RadixType.HEXADECIMAL,
+            "dec": auto.RadixType.DECIMAL,
+            "bin": auto.RadixType.BINARY,
+            "ascii": auto.RadixType.ASCII,
+        }
+        radix = radix_map.get(args.get("radix", "hex"), auto.RadixType.HEXADECIMAL)
+
+        # Export analyzer data to temp CSV
+        _ensure_output_dir()
+        tmp_path = os.path.join(
+            config.output_dir,
+            f"_proto_{args['capture_id']}_{args['analyzer_index']}.csv",
+        )
+        export_config = auto.DataTableExportConfiguration(
+            analyzer=handle, radix=radix
+        )
+        capture.export_data_table(filepath=tmp_path, analyzers=[export_config])
+        csv_content = _read_file(tmp_path)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+        rows = list(csv.DictReader(io.StringIO(csv_content)))
+        if not rows:
+            return _json_text({"bytes": [], "count": 0})
+
+        # Detect protocol from columns
+        cols_lower = {c.lower(): c for c in rows[0]}
+        protocol = "unknown"
+        if any("address" in c or "sda" in c for c in cols_lower):
+            protocol = "i2c"
+        elif any("mosi" in c or "miso" in c for c in cols_lower):
+            protocol = "spi"
+        elif any(c == "data" for c in cols_lower):
+            protocol = "uart"
+
+        # Extract bytes based on protocol
+        hex_bytes = []
+        byte_values = []
+
+        if protocol == "uart":
+            data_col = cols_lower.get("data")
+            if data_col:
+                data_col = cols_lower[data_col] if data_col in cols_lower else "data"
+                # Find actual column name (case-sensitive)
+                for c in rows[0]:
+                    if c.lower() == "data":
+                        data_col = c
+                        break
+                for row in rows:
+                    val = row.get(data_col, "").strip()
+                    if not val:
+                        continue
+                    parsed = _parse_byte_value(val)
+                    if parsed is not None:
+                        hex_bytes.append(f"0x{parsed:02X}")
+                        byte_values.append(parsed)
+                        if len(byte_values) >= max_bytes:
+                            break
+
+        elif protocol == "i2c":
+            # Extract address and data bytes from I2C transactions
+            addr_col = None
+            data_col = None
+            type_col = None
+            for c in rows[0]:
+                cl = c.lower()
+                if "address" in cl:
+                    addr_col = c
+                elif "data" in cl:
+                    data_col = c
+                elif "type" in cl:
+                    type_col = c
+
+            for row in rows:
+                # Skip start/stop markers that have no data
+                row_type = row.get(type_col, "").strip().lower() if type_col else ""
+                if row_type in ("start", "stop"):
+                    continue
+
+                # Try address byte
+                if addr_col:
+                    val = row.get(addr_col, "").strip()
+                    if val:
+                        parsed = _parse_byte_value(val)
+                        if parsed is not None:
+                            hex_bytes.append(f"0x{parsed:02X}")
+                            byte_values.append(parsed)
+
+                # Try data byte
+                if data_col:
+                    val = row.get(data_col, "").strip()
+                    if val:
+                        parsed = _parse_byte_value(val)
+                        if parsed is not None:
+                            hex_bytes.append(f"0x{parsed:02X}")
+                            byte_values.append(parsed)
+
+                if len(byte_values) >= max_bytes:
+                    break
+
+        elif protocol == "spi":
+            mosi_col = None
+            miso_col = None
+            for c in rows[0]:
+                cl = c.lower()
+                if "mosi" in cl:
+                    mosi_col = c
+                elif "miso" in cl:
+                    miso_col = c
+
+            mosi_bytes = []
+            miso_bytes = []
+            for row in rows:
+                if mosi_col:
+                    val = row.get(mosi_col, "").strip()
+                    if val:
+                        parsed = _parse_byte_value(val)
+                        if parsed is not None:
+                            mosi_bytes.append(f"0x{parsed:02X}")
+                if miso_col:
+                    val = row.get(miso_col, "").strip()
+                    if val:
+                        parsed = _parse_byte_value(val)
+                        if parsed is not None:
+                            miso_bytes.append(f"0x{parsed:02X}")
+                if len(mosi_bytes) + len(miso_bytes) >= max_bytes * 2:
+                    break
+
+            result = {
+                "protocol": "spi",
+                "total_rows": len(rows),
+            }
+            if mosi_bytes:
+                result["mosi_bytes"] = mosi_bytes[:max_bytes]
+                result["mosi_count"] = len(mosi_bytes)
+                if include_ascii:
+                    result["mosi_ascii"] = _bytes_to_ascii(
+                        [int(b, 16) for b in mosi_bytes[:max_bytes]]
+                    )
+            if miso_bytes:
+                result["miso_bytes"] = miso_bytes[:max_bytes]
+                result["miso_count"] = len(miso_bytes)
+                if include_ascii:
+                    result["miso_ascii"] = _bytes_to_ascii(
+                        [int(b, 16) for b in miso_bytes[:max_bytes]]
+                    )
+            return _json_text(result)
+
+        else:
+            # Generic: try to find any data-like column
+            for c in rows[0]:
+                if "data" in c.lower():
+                    for row in rows:
+                        val = row.get(c, "").strip()
+                        if val:
+                            parsed = _parse_byte_value(val)
+                            if parsed is not None:
+                                hex_bytes.append(f"0x{parsed:02X}")
+                                byte_values.append(parsed)
+                                if len(byte_values) >= max_bytes:
+                                    break
+                    break
+
+        result = {
+            "protocol": protocol,
+            "bytes": hex_bytes,
+            "count": len(hex_bytes),
+            "total_rows": len(rows),
+        }
+        if include_ascii and byte_values:
+            result["ascii"] = _bytes_to_ascii(byte_values)
+        return _json_text(result)
+
+    def _parse_byte_value(val: str) -> int | None:
+        """Parse a byte value from various formats (0xFF, 255, 0b11111111)."""
+        val = val.strip()
+        if not val:
+            return None
+        try:
+            if val.startswith("0x") or val.startswith("0X"):
+                return int(val, 16) & 0xFF
+            elif val.startswith("0b") or val.startswith("0B"):
+                return int(val, 2) & 0xFF
+            elif val.startswith("'") and val.endswith("'") and len(val) == 3:
+                return ord(val[1])
+            else:
+                return int(val) & 0xFF
+        except (ValueError, OverflowError):
+            return None
+
+    def _bytes_to_ascii(byte_values: list[int]) -> str:
+        """Convert byte values to ASCII, replacing non-printable with '.'."""
+        chars = []
+        for b in byte_values:
+            if 32 <= b <= 126:
+                chars.append(chr(b))
+            elif b == 10:
+                chars.append("\n")
+            elif b == 13:
+                chars.append("\r")
+            elif b == 9:
+                chars.append("\t")
+            else:
+                chars.append(".")
+        return "".join(chars)
 
     def _handle_deep_analyze(args: dict) -> list[TextContent]:
         capture = _get_capture(args["capture_id"])

@@ -43,7 +43,7 @@ Add to your Claude Code MCP settings:
 | `--output-dir` | `./captures` | Default directory for exports (resolved to absolute) |
 | `--log-level` | `info` | Logging level |
 
-## Tools (19)
+## Tools (20)
 
 ### Core Capture & Device
 
@@ -74,6 +74,7 @@ Add to your Claude Code MCP settings:
 | `analyze_capture` | Smart summary: packet counts, errors, addresses, timing |
 | `search_protocol_data` | Search analyzer results for specific values/patterns |
 | `get_timing_info` | Calculate frequency, duty cycle, pulse widths |
+| `read_protocol_data` | Read decoded bytes from UART/I2C/SPI — hex output with optional ASCII translation |
 | `deep_analyze` | Statistical analysis with numpy/pandas (timing distributions, FFT, jitter, error rates) |
 
 ### Advanced
@@ -155,6 +156,26 @@ The `deep_analyze` tool provides statistical analysis beyond basic counting:
 3. wait_capture(capture_id)
 4. deep_analyze(capture_id, channel=0)          # digital signal stats
 5. deep_analyze(capture_id, analog_channel=0)   # analog FFT + stats
+```
+
+### Read UART Bytes with ASCII
+
+```
+1. start_capture(channels=[0], duration_seconds=5)
+2. wait_capture(capture_id)
+3. add_analyzer(capture_id, "Async Serial", {"Input Channel": 0, "Bit Rate": 115200})
+4. read_protocol_data(capture_id, analyzer_index=0, ascii=True)
+   # Returns: {"bytes": ["0x48","0x65","0x6C","0x6C","0x6F"], "ascii": "Hello", ...}
+```
+
+### Read I2C Data Bytes
+
+```
+1. start_capture(channels=[0,1], duration_seconds=2)
+2. wait_capture(capture_id)
+3. add_analyzer(capture_id, "I2C", {"SCL": 0, "SDA": 1})
+4. read_protocol_data(capture_id, analyzer_index=0)
+   # Returns: {"bytes": ["0x48","0x00","0xFF",...], "ascii": "H..", "protocol": "i2c"}
 ```
 
 ### Verify UART Boot Output
