@@ -83,25 +83,25 @@ def test_parse_args_absolute_output_dir_unchanged(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_tool_count():
-    """Server must register exactly 18 tools."""
+    """Server must register exactly 19 tools."""
     config = Config()
     server = create_server(config)
     req = ListToolsRequest(method="tools/list")
     result = await server.request_handlers[ListToolsRequest](req)
     tools = result.root.tools
-    assert len(tools) == 18, f"expected 18 tools, got {len(tools)}"
+    assert len(tools) == 19, f"expected 19 tools, got {len(tools)}"
 
 
 @pytest.mark.asyncio
 async def test_all_tool_names():
-    """All 18 expected tool names must be registered."""
+    """All 19 expected tool names must be registered."""
     expected = {
         "get_app_info", "list_devices", "start_capture", "stop_capture",
         "wait_capture", "close_capture", "save_capture", "load_capture",
         "add_analyzer", "add_high_level_analyzer", "export_analyzer_data",
         "export_raw_data", "analyze_capture", "search_protocol_data",
         "get_timing_info", "configure_trigger", "compare_captures",
-        "stream_capture",
+        "stream_capture", "deep_analyze",
     }
     config = Config()
     server = create_server(config)

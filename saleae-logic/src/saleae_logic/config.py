@@ -10,6 +10,9 @@ class Config:
     output_dir: str = "./captures"
     log_level: str = "info"
 
+    def __post_init__(self):
+        self.output_dir = os.path.abspath(self.output_dir)
+
 
 def parse_args() -> Config:
     parser = argparse.ArgumentParser(description="Saleae Logic 2 MCP Server")

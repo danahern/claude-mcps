@@ -14,6 +14,9 @@ from .analysis import (
     analyze_spi_data,
     analyze_uart_data,
     compute_timing_info,
+    deep_analyze_analog,
+    deep_analyze_digital,
+    deep_analyze_protocol,
     search_csv_data,
 )
 from .config import Config
@@ -22,6 +25,44 @@ logger = logging.getLogger(__name__)
 
 # Lazy import — logic2-automation may not be installed in test environments
 automation = None
+
+# Known valid sample rate pairs per device type (from Saleae specs).
+# No runtime API to query these — must be hardcoded.
+DEVICE_RATE_INFO = {
+    "LOGIC_PRO_16": {
+        "max_digital": 500_000_000,
+        "max_analog": 50_000_000,
+        "has_analog": True,
+        "channels": 16,
+        "suggested_pairs": [
+            (125_000_000, 12_500_000),
+            (50_000_000, 12_500_000),
+            (50_000_000, 6_250_000),
+            (25_000_000, 3_125_000),
+        ],
+    },
+    "LOGIC_PRO_8": {
+        "max_digital": 500_000_000,
+        "max_analog": 50_000_000,
+        "has_analog": True,
+        "channels": 8,
+        "suggested_pairs": [
+            (125_000_000, 12_500_000),
+            (50_000_000, 6_250_000),
+            (25_000_000, 3_125_000),
+        ],
+    },
+    "LOGIC_8": {
+        "max_digital": 100_000_000,
+        "max_analog": 0,
+        "has_analog": False,
+        "channels": 8,
+        "suggested_pairs": [],
+    },
+}
+
+# Default rates when analog channels are requested but no rates specified
+_DEFAULT_DIGITAL_ANALOG_RATE = (50_000_000, 6_250_000)
 
 
 def _get_automation():
@@ -82,6 +123,10 @@ def create_server(config: Config) -> Server:
             )
         return handle
 
+    def _abs_path(path: str) -> str:
+        """Resolve relative paths to absolute — Logic 2 is a separate process."""
+        return os.path.abspath(path)
+
     def _text(content: str) -> list[TextContent]:
         return [TextContent(type="text", text=content)]
 
@@ -136,11 +181,19 @@ def create_server(config: Config) -> Server:
                     },
                     "sample_rate": {
                         "type": "integer",
-                        "description": "Digital sample rate in Hz (default: 10000000)",
+                        "description": (
+                            "Digital sample rate in Hz. Default: 10M (digital-only) or "
+                            "50M (with analog). Max: 500M (Pro 16/8), 100M (Logic 8). "
+                            "Must be a valid pair with analog_sample_rate when both are used."
+                        ),
                     },
                     "analog_sample_rate": {
                         "type": "integer",
-                        "description": "Analog sample rate in Hz",
+                        "description": (
+                            "Analog sample rate in Hz. Auto-selected (6.25M) if omitted "
+                            "when analog_channels are present. Valid pairs with digital rate: "
+                            "125M+12.5M, 50M+12.5M, 50M+6.25M, 25M+3.125M."
+                        ),
                     },
                     "duration_seconds": {
                         "type": "number",
@@ -534,6 +587,33 @@ def create_server(config: Config) -> Server:
                 ],
             },
         ),
+        Tool(
+            name="deep_analyze",
+            description=(
+                "Statistical analysis of captured data using numpy/pandas. "
+                "For protocol data: timing distributions, throughput, error rates, address frequency. "
+                "For raw signals: jitter, pulse width stats, FFT frequency spectrum."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "capture_id": {"type": "string", "description": "Capture ID"},
+                    "analyzer_index": {
+                        "type": "integer",
+                        "description": "Analyze decoded protocol data",
+                    },
+                    "channel": {
+                        "type": "integer",
+                        "description": "Analyze raw digital signal",
+                    },
+                    "analog_channel": {
+                        "type": "integer",
+                        "description": "Analyze raw analog signal",
+                    },
+                },
+                "required": ["capture_id"],
+            },
+        ),
     ]
 
     @server.list_tools()
@@ -586,6 +666,8 @@ def create_server(config: Config) -> Server:
                 return _handle_compare_captures(args)
             case "stream_capture":
                 return _handle_stream_capture(args)
+            case "deep_analyze":
+                return _handle_deep_analyze(args)
             case _:
                 return _text(f"Unknown tool: {name}")
 
@@ -606,11 +688,21 @@ def create_server(config: Config) -> Server:
         devices = mgr.get_devices(include_simulation_devices=include_sim)
         result = []
         for d in devices:
-            result.append({
+            entry = {
                 "device_id": d.device_id,
                 "device_type": d.device_type.name,
                 "is_simulation": d.is_simulation,
-            })
+            }
+            rate_info = DEVICE_RATE_INFO.get(d.device_type.name)
+            if rate_info:
+                entry["rate_info"] = {
+                    "max_digital": rate_info["max_digital"],
+                    "max_analog": rate_info["max_analog"],
+                    "suggested_pairs": [
+                        list(p) for p in rate_info["suggested_pairs"]
+                    ],
+                }
+            result.append(entry)
         return _json_text(result)
 
     def _handle_start_capture(args: dict) -> list[TextContent]:
@@ -619,10 +711,16 @@ def create_server(config: Config) -> Server:
 
         channels = args.get("channels", [])
         analog_channels = args.get("analog_channels", [])
-        sample_rate = args.get("sample_rate", 10_000_000)
+        sample_rate = args.get("sample_rate")
         analog_sample_rate = args.get("analog_sample_rate")
         logic_level = args.get("logic_level")
         glitch_filter_ns = args.get("glitch_filter_ns", {})
+
+        # Auto-select sample rates when not specified
+        if analog_channels and sample_rate is None and analog_sample_rate is None:
+            sample_rate, analog_sample_rate = _DEFAULT_DIGITAL_ANALOG_RATE
+        elif sample_rate is None:
+            sample_rate = 10_000_000
 
         glitch_filters = []
         for ch_str, ns in glitch_filter_ns.items():
@@ -676,7 +774,23 @@ def create_server(config: Config) -> Server:
         if args.get("device_id"):
             kwargs["device_id"] = args["device_id"]
 
-        capture = mgr.start_capture(**kwargs)
+        try:
+            capture = mgr.start_capture(**kwargs)
+        except Exception as e:
+            err_msg = str(e)
+            if "sample rate" in err_msg.lower() or "rate" in err_msg.lower():
+                hint = (
+                    f"Sample rate error: {err_msg}\n\n"
+                    "Hint: Digital+analog rates must be valid pairs. "
+                    "Common valid pairs (digital, analog):\n"
+                    "  125 MS/s + 12.5 MS/s\n"
+                    "  50 MS/s + 12.5 MS/s\n"
+                    "  50 MS/s + 6.25 MS/s\n"
+                    "  25 MS/s + 3.125 MS/s\n"
+                    "Use list_devices() to see suggested pairs for your device."
+                )
+                return _text(f"Error: {hint}")
+            raise
         capture_id = _store_capture(capture)
 
         return _json_text({
@@ -685,6 +799,7 @@ def create_server(config: Config) -> Server:
             "digital_channels": channels,
             "analog_channels": analog_channels,
             "sample_rate": sample_rate,
+            "analog_sample_rate": analog_sample_rate,
         })
 
     def _handle_stop_capture(args: dict) -> list[TextContent]:
@@ -707,14 +822,14 @@ def create_server(config: Config) -> Server:
 
     def _handle_save_capture(args: dict) -> list[TextContent]:
         capture = _get_capture(args["capture_id"])
-        filepath = args["filepath"]
-        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        filepath = _abs_path(args["filepath"])
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         capture.save_capture(filepath=filepath)
         return _text(f"Capture saved to {filepath}")
 
     def _handle_load_capture(args: dict) -> list[TextContent]:
         mgr = _get_manager()
-        filepath = args["filepath"]
+        filepath = _abs_path(args["filepath"])
         capture = mgr.load_capture(filepath=filepath)
         capture_id = _store_capture(capture)
         return _json_text({"capture_id": capture_id, "loaded_from": filepath})
@@ -773,7 +888,9 @@ def create_server(config: Config) -> Server:
         radix = radix_map.get(args.get("radix", "hex"), auto.RadixType.HEXADECIMAL)
 
         output_path = args.get("output_path")
-        if not output_path:
+        if output_path:
+            output_path = _abs_path(output_path)
+        else:
             _ensure_output_dir()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = os.path.join(
@@ -781,7 +898,7 @@ def create_server(config: Config) -> Server:
                 f"analyzer_{args['capture_id']}_{args['analyzer_index']}_{timestamp}.csv",
             )
 
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         export_config = auto.DataTableExportConfiguration(
             analyzer=handle, radix=radix
@@ -1094,6 +1211,98 @@ def create_server(config: Config) -> Server:
             "note": "Capture remains open. Use close_capture to release.",
         }, indent=2)
         return [TextContent(type="text", text=info)] + result
+
+    def _handle_deep_analyze(args: dict) -> list[TextContent]:
+        capture = _get_capture(args["capture_id"])
+        capture_id = args["capture_id"]
+        _ensure_output_dir()
+
+        if "analyzer_index" in args:
+            # Protocol deep analysis
+            auto = _get_automation()
+            handle = _get_analyzer(capture_id, args["analyzer_index"])
+            tmp_path = os.path.join(
+                config.output_dir,
+                f"_deep_{capture_id}_{args['analyzer_index']}.csv",
+            )
+            export_config = auto.DataTableExportConfiguration(
+                analyzer=handle, radix=auto.RadixType.HEXADECIMAL
+            )
+            capture.export_data_table(filepath=tmp_path, analyzers=[export_config])
+            csv_content = _read_file(tmp_path)
+
+            # Detect protocol from column headers
+            headers = _get_csv_headers(csv_content)
+            headers_lower = [h.lower() for h in headers]
+            if any("sda" in h or "address" in h for h in headers_lower):
+                protocol = "I2C"
+            elif any("mosi" in h or "miso" in h for h in headers_lower):
+                protocol = "SPI"
+            elif any("data" in h and len(headers) <= 4 for h in headers_lower):
+                protocol = "UART"
+            else:
+                protocol = "unknown"
+
+            result = deep_analyze_protocol(csv_content, protocol)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return _json_text(result)
+
+        elif "channel" in args:
+            # Raw digital deep analysis
+            channel = args["channel"]
+            tmp_dir = os.path.join(config.output_dir, f"_deep_dig_{capture_id}")
+            os.makedirs(tmp_dir, exist_ok=True)
+            capture.export_raw_data_csv(
+                directory=tmp_dir, digital_channels=[channel]
+            )
+            csv_files = [f for f in os.listdir(tmp_dir) if f.endswith(".csv")]
+            if not csv_files:
+                return _text("No raw data exported for this channel.")
+            csv_content = _read_file(os.path.join(tmp_dir, csv_files[0]))
+            result = deep_analyze_digital(csv_content, channel)
+            for f in csv_files:
+                try:
+                    os.remove(os.path.join(tmp_dir, f))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+            return _json_text(result)
+
+        elif "analog_channel" in args:
+            # Raw analog deep analysis
+            channel = args["analog_channel"]
+            tmp_dir = os.path.join(config.output_dir, f"_deep_ana_{capture_id}")
+            os.makedirs(tmp_dir, exist_ok=True)
+            capture.export_raw_data_csv(
+                directory=tmp_dir, analog_channels=[channel]
+            )
+            csv_files = [f for f in os.listdir(tmp_dir) if f.endswith(".csv")]
+            if not csv_files:
+                return _text("No raw data exported for this channel.")
+            csv_content = _read_file(os.path.join(tmp_dir, csv_files[0]))
+            result = deep_analyze_analog(csv_content)
+            for f in csv_files:
+                try:
+                    os.remove(os.path.join(tmp_dir, f))
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
+            return _json_text(result)
+
+        else:
+            return _text(
+                "Error: Provide one of: analyzer_index (protocol), "
+                "channel (digital), or analog_channel (analog)"
+            )
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
