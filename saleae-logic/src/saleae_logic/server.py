@@ -1639,36 +1639,21 @@ def create_server(config: Config) -> Server:
             part.capitalize() for part in re.split(r"[_\-]+", slug)
         ) or "CustomHla"
 
-        # Build result_types for extension.json
         result_types = args.get("result_types", {})
         if not result_types:
             result_types = {"output": "{{data.value}}"}
-
-        ext_result_types = {}
-        for rt_name, fmt in result_types.items():
-            ext_result_types[rt_name] = {"format": fmt}
-
-        # Build settings for extension.json
         settings_def = args.get("settings", {})
-        ext_settings = {}
-        for s_name, s_cfg in settings_def.items():
-            s_type = s_cfg.get("type", "string")
-            entry: dict[str, Any] = {"type": s_type}
-            if "default" in s_cfg:
-                entry["default"] = s_cfg["default"]
-            if "choices" in s_cfg:
-                entry["choices"] = s_cfg["choices"]
-            ext_settings[s_name] = entry
 
-        # Write extension.json
+        # Write extension.json — Logic 2 format requires type + entryPoint
         ext_json = {
             "version": "0.0.1",
             "apiVersion": "1.0.0",
+            "author": "Generated",
+            "name": name,
             "extensions": {
                 class_name: {
-                    "entry": "HighLevelAnalyzer.py",
-                    "settings": ext_settings,
-                    "resultTypes": ext_result_types,
+                    "type": "HighLevelAnalyzer",
+                    "entryPoint": f"HighLevelAnalyzer.{class_name}",
                 }
             },
         }
@@ -1678,67 +1663,73 @@ def create_server(config: Config) -> Server:
 
         # Write HighLevelAnalyzer.py
         if args.get("source"):
-            # Full source provided — write as-is
             py_source = args["source"]
         else:
-            # Generate boilerplate from decode_body
             decode_body = args.get("decode_body", "return None")
-            # Indent each line of decode_body
             indented = "\n".join(
                 "        " + line if line.strip() else ""
                 for line in decode_body.splitlines()
             )
 
-            # Build result_type definitions for the class
-            rt_lines = []
+            # Build result_types dict for the class
+            rt_items = []
             for rt_name, fmt in result_types.items():
-                rt_lines.append(
-                    f"    result_types = {{"
-                    f"\n        '{rt_name}': {{"
-                    f"\n            'format': '{fmt}',"
-                    f"\n        }},"
-                    f"\n    }}"
+                rt_items.append(
+                    f"        '{rt_name}': {{\n"
+                    f"            'format': '{fmt}',\n"
+                    f"        }}"
                 )
-            rt_block = rt_lines[0] if rt_lines else "    result_types = {}"
+            rt_block = "    result_types = {\n" + ",\n".join(rt_items) + "\n    }"
 
-            # Build settings definitions
-            if settings_def:
-                settings_lines = ["    settings = {"]
-                for s_name, s_cfg in settings_def.items():
-                    s_type = s_cfg.get("type", "string")
-                    if s_type == "string":
-                        default = s_cfg.get("default", "")
-                        settings_lines.append(
-                            f"        '{s_name}': StringSetting(label='{s_name}'),"
-                        )
-                    elif s_type == "number":
-                        settings_lines.append(
-                            f"        '{s_name}': NumberSetting(label='{s_name}'),"
-                        )
-                    elif s_type == "choices":
-                        choices = s_cfg.get("choices", [])
-                        settings_lines.append(
-                            f"        '{s_name}': ChoicesSetting(label='{s_name}', choices={choices}),"
-                        )
-                settings_lines.append("    }")
-                settings_block = "\n".join(settings_lines)
+            # Build settings for the class (imports added as needed)
+            extra_imports = []
+            settings_items = []
+            for s_name, s_cfg in settings_def.items():
+                s_type = s_cfg.get("type", "string")
+                if s_type == "string":
+                    extra_imports.append("StringSetting")
+                    settings_items.append(
+                        f"        '{s_name}': StringSetting(label='{s_name}'),"
+                    )
+                elif s_type == "number":
+                    extra_imports.append("NumberSetting")
+                    settings_items.append(
+                        f"        '{s_name}': NumberSetting(label='{s_name}'),"
+                    )
+                elif s_type == "choices":
+                    extra_imports.append("ChoicesSetting")
+                    choices = s_cfg.get("choices", [])
+                    settings_items.append(
+                        f"        '{s_name}': ChoicesSetting(label='{s_name}', choices={choices}),"
+                    )
+
+            if settings_items:
+                settings_block = (
+                    "    settings = {\n"
+                    + "\n".join(settings_items)
+                    + "\n    }\n"
+                )
             else:
                 settings_block = ""
 
-            py_source = f'''from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame
+            import_line = "from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame"
+            if extra_imports:
+                unique = sorted(set(extra_imports))
+                import_line += ", " + ", ".join(unique)
 
-
-class {class_name}(HighLevelAnalyzer):
-{rt_block}
-{settings_block}
-
-    def __init__(self):
-        self.temp_frame = None
-
-    def decode(self, frame: AnalyzerFrame):
-        data = frame
-{indented}
-'''
+            py_source = (
+                f"{import_line}\n"
+                f"\n\n"
+                f"class {class_name}(HighLevelAnalyzer):\n"
+                f"{rt_block}\n"
+                f"{settings_block}\n"
+                f"    def __init__(self):\n"
+                f"        self.temp_frame = None\n"
+                f"\n"
+                f"    def decode(self, frame: AnalyzerFrame):\n"
+                f"        data = frame\n"
+                f"{indented}\n"
+            )
 
         py_path = os.path.join(ext_dir, "HighLevelAnalyzer.py")
         with open(py_path, "w") as f:
