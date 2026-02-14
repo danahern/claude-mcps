@@ -1,12 +1,13 @@
 # saleae-logic MCP Server — Implementation Plan
 
-## Status: 20 tools — path fix, smart rates, deep analysis, protocol byte reader
+## Status: 21 tools — path fix, smart rates, deep analysis, protocol byte reader, HLA generator
 
-All 20 tools implemented, 25 unit/smoke tests passing. Four enhancements:
+All 21 tools implemented, 25 unit/smoke tests passing. Five enhancements:
 1. **Path fix**: All user-supplied paths resolved to absolute before sending to Logic 2
 2. **Smart sample rates**: Auto-selection for analog captures, rate table per device, helpful error messages
 3. **Deep analysis**: New `deep_analyze` tool with numpy/pandas statistical analysis
 4. **Protocol byte reader**: New `read_protocol_data` tool extracts decoded bytes from UART/I2C/SPI with ASCII translation
+5. **HLA generator**: New `create_extension` tool generates custom High Level Analyzer extensions on the fly
 
 ## Architecture
 
@@ -25,12 +26,12 @@ claude-mcps/saleae-logic/
     └── saleae_logic/
         ├── __init__.py
         ├── __main__.py      # Entry point
-        ├── server.py        # MCP server + 19 tool definitions
+        ├── server.py        # MCP server + 21 tool definitions
         ├── config.py        # CLI args
         └── analysis.py      # CSV parsing, basic + deep analysis
 ```
 
-## Tools (20)
+## Tools (21)
 
 ### Core (8)
 1. get_app_info
@@ -52,13 +53,14 @@ claude-mcps/saleae-logic/
 13. analyze_capture
 14. search_protocol_data
 15. get_timing_info
-16. **read_protocol_data** — NEW: extract decoded bytes with ASCII translation
-17. **deep_analyze** — NEW: statistical analysis with numpy/pandas
+16. read_protocol_data — extract decoded bytes with ASCII translation
+17. deep_analyze — statistical analysis with numpy/pandas
 
-### Advanced (3)
+### Advanced (4)
 18. configure_trigger
 19. compare_captures
 20. stream_capture
+21. **create_extension** — generate custom HLA extensions from decode logic
 
 ## Key Decisions
 
@@ -100,7 +102,7 @@ cd claude-mcps/saleae-logic && .venv/bin/python -m pytest tests/test_analysis.py
 - Pure logic tests, no server or hardware needed
 
 **Smoke tests** (`tests/test_server_startup.py` — 10 tests):
-- Server creation, handler registration, tool count (20), config paths
+- Server creation, handler registration, tool count (21), config paths
 
 **Hardware tests** (require Logic 2):
 - `test_connection.py` — get_app_info, list_devices

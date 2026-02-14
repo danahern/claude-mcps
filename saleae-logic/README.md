@@ -43,7 +43,7 @@ Add to your Claude Code MCP settings:
 | `--output-dir` | `./captures` | Default directory for exports (resolved to absolute) |
 | `--log-level` | `info` | Logging level |
 
-## Tools (20)
+## Tools (21)
 
 ### Core Capture & Device
 
@@ -84,6 +84,7 @@ Add to your Claude Code MCP settings:
 | `configure_trigger` | Set up digital triggers with linked channels |
 | `compare_captures` | Diff two captures for regression testing |
 | `stream_capture` | One-shot: capture + decode + return results |
+| `create_extension` | Generate custom HLA extension from decode logic |
 
 ## Sample Rates
 
@@ -196,6 +197,21 @@ stream_capture(
     analyzer_name="SPI",
     analyzer_settings={"MISO": 0, "Clock": 1, "Enable": 2}
 )
+```
+
+### Custom HLA Extension (create_extension)
+
+```
+1. start_capture(channels=[0,1], duration_seconds=2)
+2. wait_capture(capture_id)
+3. add_analyzer(capture_id, "I2C", {"SCL": 0, "SDA": 1})
+4. create_extension(
+       name="IMU Register Decoder",
+       decode_body="if data.type == 'data':\n    return AnalyzerFrame('reg', data.start_time, data.end_time, {'value': data.data['data'][0]})",
+       result_types={"reg": "Register: {{data.value}}"}
+   )
+   # Returns: {"extension_directory": "/path/to/extensions/imu_register_decoder", ...}
+5. add_high_level_analyzer(capture_id, extension_directory=ext_dir, name="ImuRegisterDecoder", input_analyzer_index=0)
 ```
 
 ## Analyzer Settings Reference

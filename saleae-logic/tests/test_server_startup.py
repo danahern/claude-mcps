@@ -89,7 +89,7 @@ async def test_tool_count():
     req = ListToolsRequest(method="tools/list")
     result = await server.request_handlers[ListToolsRequest](req)
     tools = result.root.tools
-    assert len(tools) == 20, f"expected 20 tools, got {len(tools)}"
+    assert len(tools) == 21, f"expected 21 tools, got {len(tools)}"
 
 
 @pytest.mark.asyncio
@@ -102,6 +102,7 @@ async def test_all_tool_names():
         "export_raw_data", "analyze_capture", "search_protocol_data",
         "get_timing_info", "read_protocol_data", "configure_trigger",
         "compare_captures", "stream_capture", "deep_analyze",
+        "create_extension",
     }
     config = Config()
     server = create_server(config)

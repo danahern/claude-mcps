@@ -650,6 +650,67 @@ def create_server(config: Config) -> Server:
                 "required": ["capture_id"],
             },
         ),
+        Tool(
+            name="create_extension",
+            description=(
+                "Create a custom High Level Analyzer (HLA) extension for Logic 2. "
+                "Generates a Python HLA that processes frames from a low-level analyzer "
+                "(I2C, SPI, UART) and produces higher-level decoded output. "
+                "Returns the extension directory path for use with add_high_level_analyzer. "
+                "\n\nInput frame types by protocol:"
+                "\n- I2C: type='start'|'stop'|'address'|'data', "
+                "data.address=[int] for address frames, data.data=[int] for data frames"
+                "\n- SPI: type='result', data.miso=int, data.mosi=int"
+                "\n- UART/Serial: type='data', data.value=int, "
+                "data.parity_error=bool, data.framing_error=bool"
+                "\n\nProvide EITHER 'source' (full Python class) OR 'decode_body' "
+                "(just the decode method body, boilerplate is generated)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Extension name (e.g., 'IMU Register Decoder')",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": (
+                            "Full Python source for the HLA class. Must define a class "
+                            "that implements decode(self, data) and set_settings(self, settings). "
+                            "If omitted, provide decode_body instead."
+                        ),
+                    },
+                    "decode_body": {
+                        "type": "string",
+                        "description": (
+                            "Python code for the decode() method body only. "
+                            "The frame dict is available as 'data' with keys: "
+                            "type, start_time, end_time, data. "
+                            "Return a dict with type, start_time, end_time, data to emit a frame, "
+                            "or None to skip. Use self.temp_frame to accumulate across calls."
+                        ),
+                    },
+                    "result_types": {
+                        "type": "object",
+                        "description": (
+                            "Output frame types and display formats. "
+                            "Keys are type names, values are format strings using {{data.field}}. "
+                            "Example: {\"register\": \"Reg {{data.addr}}: {{data.value}}\"}"
+                        ),
+                    },
+                    "settings": {
+                        "type": "object",
+                        "description": (
+                            "HLA settings definitions. Keys are setting names, "
+                            "values are objects with 'type' ('string'|'number'|'choices') "
+                            "and optional 'default', 'choices' fields."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        ),
     ]
 
     @server.list_tools()
@@ -706,6 +767,8 @@ def create_server(config: Config) -> Server:
                 return _handle_read_protocol_data(args)
             case "deep_analyze":
                 return _handle_deep_analyze(args)
+            case "create_extension":
+                return _handle_create_extension(args)
             case _:
                 return _text(f"Unknown tool: {name}")
 
@@ -1557,6 +1620,141 @@ def create_server(config: Config) -> Server:
                 "Error: Provide one of: analyzer_index (protocol), "
                 "channel (digital), or analog_channel (analog)"
             )
+
+    def _handle_create_extension(args: dict) -> list[TextContent]:
+        import json
+        import re
+
+        name = args["name"]
+        # Sanitize name for directory
+        slug = re.sub(r"[^a-zA-Z0-9_-]", "_", name.lower()).strip("_")
+        if not slug:
+            slug = "custom_hla"
+
+        ext_dir = os.path.join(config.output_dir, "extensions", slug)
+        os.makedirs(ext_dir, exist_ok=True)
+
+        # Class name: PascalCase from the slug
+        class_name = "".join(
+            part.capitalize() for part in re.split(r"[_\-]+", slug)
+        ) or "CustomHla"
+
+        # Build result_types for extension.json
+        result_types = args.get("result_types", {})
+        if not result_types:
+            result_types = {"output": "{{data.value}}"}
+
+        ext_result_types = {}
+        for rt_name, fmt in result_types.items():
+            ext_result_types[rt_name] = {"format": fmt}
+
+        # Build settings for extension.json
+        settings_def = args.get("settings", {})
+        ext_settings = {}
+        for s_name, s_cfg in settings_def.items():
+            s_type = s_cfg.get("type", "string")
+            entry: dict[str, Any] = {"type": s_type}
+            if "default" in s_cfg:
+                entry["default"] = s_cfg["default"]
+            if "choices" in s_cfg:
+                entry["choices"] = s_cfg["choices"]
+            ext_settings[s_name] = entry
+
+        # Write extension.json
+        ext_json = {
+            "version": "0.0.1",
+            "apiVersion": "1.0.0",
+            "extensions": {
+                class_name: {
+                    "entry": "HighLevelAnalyzer.py",
+                    "settings": ext_settings,
+                    "resultTypes": ext_result_types,
+                }
+            },
+        }
+        ext_json_path = os.path.join(ext_dir, "extension.json")
+        with open(ext_json_path, "w") as f:
+            json.dump(ext_json, f, indent=2)
+
+        # Write HighLevelAnalyzer.py
+        if args.get("source"):
+            # Full source provided — write as-is
+            py_source = args["source"]
+        else:
+            # Generate boilerplate from decode_body
+            decode_body = args.get("decode_body", "return None")
+            # Indent each line of decode_body
+            indented = "\n".join(
+                "        " + line if line.strip() else ""
+                for line in decode_body.splitlines()
+            )
+
+            # Build result_type definitions for the class
+            rt_lines = []
+            for rt_name, fmt in result_types.items():
+                rt_lines.append(
+                    f"    result_types = {{"
+                    f"\n        '{rt_name}': {{"
+                    f"\n            'format': '{fmt}',"
+                    f"\n        }},"
+                    f"\n    }}"
+                )
+            rt_block = rt_lines[0] if rt_lines else "    result_types = {}"
+
+            # Build settings definitions
+            if settings_def:
+                settings_lines = ["    settings = {"]
+                for s_name, s_cfg in settings_def.items():
+                    s_type = s_cfg.get("type", "string")
+                    if s_type == "string":
+                        default = s_cfg.get("default", "")
+                        settings_lines.append(
+                            f"        '{s_name}': StringSetting(label='{s_name}'),"
+                        )
+                    elif s_type == "number":
+                        settings_lines.append(
+                            f"        '{s_name}': NumberSetting(label='{s_name}'),"
+                        )
+                    elif s_type == "choices":
+                        choices = s_cfg.get("choices", [])
+                        settings_lines.append(
+                            f"        '{s_name}': ChoicesSetting(label='{s_name}', choices={choices}),"
+                        )
+                settings_lines.append("    }")
+                settings_block = "\n".join(settings_lines)
+            else:
+                settings_block = ""
+
+            py_source = f'''from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame
+
+
+class {class_name}(HighLevelAnalyzer):
+{rt_block}
+{settings_block}
+
+    def __init__(self):
+        self.temp_frame = None
+
+    def decode(self, frame: AnalyzerFrame):
+        data = frame
+{indented}
+'''
+
+        py_path = os.path.join(ext_dir, "HighLevelAnalyzer.py")
+        with open(py_path, "w") as f:
+            f.write(py_source)
+
+        return _json_text({
+            "extension_directory": ext_dir,
+            "class_name": class_name,
+            "files": ["extension.json", "HighLevelAnalyzer.py"],
+            "usage": (
+                f"Use with add_high_level_analyzer: "
+                f'extension_directory="{ext_dir}", '
+                f'name="{class_name}", '
+                f"input_analyzer_index=<index>"
+            ),
+        })
 
     # ── Helpers ──────────────────────────────────────────────────────────
 
