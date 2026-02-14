@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 use super::types::*;
 // Flash types will be used through crate::flash:: prefix
 use crate::rtt::RttManager;
+use crate::symbols::SymbolTable;
 use regex;
 
 // Probe-rs imports
@@ -36,13 +37,14 @@ pub struct DebugSession {
     pub rtt_manager: Arc<tokio::sync::Mutex<RttManager>>,
 }
 
-/// Complete embedded debugger tool handler with all 18 tools
+/// Complete embedded debugger tool handler with all debugging tools
 #[derive(Clone)]
 pub struct EmbeddedDebuggerToolHandler {
     #[allow(dead_code)]
     tool_router: ToolRouter<EmbeddedDebuggerToolHandler>,
     sessions: Arc<RwLock<HashMap<String, Arc<DebugSession>>>>,
     max_sessions: usize,
+    gdb_processes: Arc<RwLock<HashMap<u16, Arc<tokio::sync::Mutex<tokio::process::Child>>>>>,
 }
 
 impl EmbeddedDebuggerToolHandler {
@@ -51,6 +53,7 @@ impl EmbeddedDebuggerToolHandler {
             tool_router: Self::tool_router(),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             max_sessions,
+            gdb_processes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -2067,6 +2070,736 @@ except Exception as e:
             }
         }
     }
+
+    // =============================================================================
+    // Advanced Debugging Tools (8 tools)
+    // =============================================================================
+
+    #[tool(description = "Read all CPU registers (R0-R12, SP, LR, PC, xPSR). Target must be halted.")]
+    async fn read_registers(&self, Parameters(args): Parameters<ReadRegistersArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Reading registers for session: {}", args.session_id);
+
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&args.session_id) {
+                Some(session) => session.clone(),
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("Session '{}' not found. Use 'connect' first.", args.session_id), None));
+                }
+            }
+        };
+
+        {
+            let mut session = session_arc.session.lock().await;
+            let mut core = match session.core(0) {
+                Ok(core) => core,
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core: {}", e), None));
+                }
+            };
+
+            let mut result = String::from("CPU Registers:\n\n");
+
+            // Collect register names and IDs first to avoid borrow issues
+            let registers = core.registers();
+            let reg_info: Vec<(&'static str, probe_rs::RegisterId)> = registers
+                .core_registers()
+                .map(|r| (r.name(), r.id()))
+                .collect();
+
+            for (name, id) in &reg_info {
+                match core.read_core_reg::<u32>(*id) {
+                    Ok(v) => {
+                        result.push_str(&format!("{:<6} 0x{:08X}\n", format!("{}:", name), v));
+                    }
+                    Err(e) => {
+                        result.push_str(&format!("{:<6} <error: {}>\n", format!("{}:", name), e));
+                    }
+                }
+            }
+
+            // Read special registers explicitly
+            let pc = core.read_core_reg(core.program_counter())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+            let sp = core.read_core_reg(core.stack_pointer())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+            let lr = core.read_core_reg(core.return_address())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+
+            result.push_str(&format!("\nSpecial Registers:\n"));
+            result.push_str(&format!("{:<6} 0x{:08X}\n", "SP:", sp));
+            result.push_str(&format!("{:<6} 0x{:08X}\n", "LR:", lr));
+            result.push_str(&format!("{:<6} 0x{:08X}\n", "PC:", pc));
+
+            Ok(CallToolResult::success(vec![Content::text(result)]))
+        }
+    }
+
+    #[tool(description = "Write a value to a specific CPU register. Target must be halted.")]
+    async fn write_register(&self, Parameters(args): Parameters<WriteRegisterArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Writing register {} for session: {}", args.register, args.session_id);
+
+        let value = parse_address(&args.value).map_err(|e| {
+            McpError::internal_error(format!("Invalid register value: {}", e), None)
+        })? as u32;
+
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&args.session_id) {
+                Some(session) => session.clone(),
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("Session '{}' not found. Use 'connect' first.", args.session_id), None));
+                }
+            }
+        };
+
+        {
+            let mut session = session_arc.session.lock().await;
+            let mut core = match session.core(0) {
+                Ok(core) => core,
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core: {}", e), None));
+                }
+            };
+
+            let reg_name_upper = args.register.to_uppercase();
+
+            // Check special register names first
+            let reg_id: Option<probe_rs::RegisterId> = if reg_name_upper == "PC" {
+                Some(core.program_counter().id())
+            } else if reg_name_upper == "SP" {
+                Some(core.stack_pointer().id())
+            } else if reg_name_upper == "LR" {
+                Some(core.return_address().id())
+            } else {
+                // Search core registers
+                let registers = core.registers();
+                let reg_info: Vec<(&str, probe_rs::RegisterId)> = registers
+                    .core_registers()
+                    .map(|r| (r.name(), r.id()))
+                    .collect();
+                let mut found = None;
+                for (name, id) in &reg_info {
+                    if name.to_uppercase() == reg_name_upper {
+                        found = Some(*id);
+                        break;
+                    }
+                }
+                found
+            };
+
+            match reg_id {
+                Some(id) => {
+                    match core.write_core_reg(id, RegisterValue::U32(value)) {
+                        Ok(_) => {
+                            // Read back to confirm
+                            let readback = core.read_core_reg(id)
+                                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) })
+                                .unwrap_or(0);
+
+                            let message = format!(
+                                "Register {} written successfully.\n\n\
+                                Written:  0x{:08X}\n\
+                                Readback: 0x{:08X}\n",
+                                args.register, value, readback
+                            );
+                            Ok(CallToolResult::success(vec![Content::text(message)]))
+                        }
+                        Err(e) => {
+                            Err(McpError::internal_error(
+                                format!("Failed to write register {}: {}", args.register, e), None))
+                        }
+                    }
+                }
+                None => {
+                    Err(McpError::internal_error(
+                        format!("Unknown register: '{}'. Use R0-R12, SP, LR, PC, or xPSR.", args.register), None))
+                }
+            }
+        }
+    }
+
+    #[tool(description = "Resolve a memory address to a function name using ELF symbol table. No debug session needed.")]
+    async fn resolve_symbol(&self, Parameters(args): Parameters<ResolveSymbolArgs>) -> Result<CallToolResult, McpError> {
+        let address = parse_address(&args.address).map_err(|e| {
+            McpError::internal_error(format!("Invalid address: {}", e), None)
+        })?;
+
+        let table = SymbolTable::from_elf(std::path::Path::new(&args.elf_path)).map_err(|e| {
+            McpError::internal_error(format!("Failed to parse ELF '{}': {}", args.elf_path, e), None)
+        })?;
+
+        match table.resolve(address) {
+            Some(resolved) => {
+                let message = format!(
+                    "0x{:08X} -> {}\n\nFunction: {}\nBase:     0x{:08X}\nOffset:   0x{:X}\n",
+                    address, resolved, resolved.name, resolved.address, resolved.offset
+                );
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            }
+            None => {
+                let message = format!(
+                    "0x{:08X} -> <unknown>\n\nNo function symbol found at this address.\nLoaded {} symbols from {}\n",
+                    address, table.symbol_count(), args.elf_path
+                );
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            }
+        }
+    }
+
+    #[tool(description = "Capture stack trace with optional symbol resolution from ELF. Target must be halted. Uses frame pointer chain (R7 on Cortex-M Thumb), falls back to heuristic stack scanning.")]
+    async fn stack_trace(&self, Parameters(args): Parameters<StackTraceArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Capturing stack trace for session: {}", args.session_id);
+
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&args.session_id) {
+                Some(session) => session.clone(),
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("Session '{}' not found. Use 'connect' first.", args.session_id), None));
+                }
+            }
+        };
+
+        // Load symbol table if ELF provided
+        let sym_table = if let Some(ref elf_path) = args.elf_path {
+            match SymbolTable::from_elf(std::path::Path::new(elf_path)) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    warn!("Failed to load symbols from {}: {}", elf_path, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        {
+            let mut session = session_arc.session.lock().await;
+            let mut core = match session.core(0) {
+                Ok(core) => core,
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core: {}", e), None));
+                }
+            };
+
+            // Verify target is halted
+            match core.status() {
+                Ok(CoreStatus::Halted(_)) => {},
+                Ok(_) => {
+                    return Err(McpError::internal_error(
+                        "Target must be halted for stack trace. Use 'halt' first.".to_string(), None));
+                }
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core status: {}", e), None));
+                }
+            }
+
+            let pc = core.read_core_reg(core.program_counter())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+            let sp = core.read_core_reg(core.stack_pointer())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+            let lr = core.read_core_reg(core.return_address())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+
+            // Try to read R7 (frame pointer for Thumb)
+            let mut fp: u32 = 0;
+            {
+                let registers = core.registers();
+                let reg_info: Vec<(&str, probe_rs::RegisterId)> = registers
+                    .core_registers()
+                    .map(|r| (r.name(), r.id()))
+                    .collect();
+                for (name, id) in &reg_info {
+                    if name.to_uppercase() == "R7" {
+                        fp = core.read_core_reg(*id)
+                            .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+                        break;
+                    }
+                }
+            }
+
+            let mut frames = Vec::new();
+            let max_frames = args.max_frames as usize;
+
+            // Frame 0: current PC
+            let sym0 = sym_table.as_ref().and_then(|t| t.resolve(pc as u64));
+            frames.push(format_stack_frame(0, pc, sym0.as_ref()));
+
+            // Frame 1: LR (return address)
+            if frames.len() < max_frames && is_valid_code_address(lr) {
+                let sym1 = sym_table.as_ref().and_then(|t| t.resolve(lr as u64));
+                frames.push(format_stack_frame(1, lr, sym1.as_ref()));
+            }
+
+            // Frames 2+: Walk frame pointer chain
+            let mut current_fp = fp;
+            let mut fp_walk_ok = is_valid_ram_address(current_fp);
+            let mut frame_idx = 2;
+
+            while fp_walk_ok && frame_idx < max_frames {
+                // Read [FP] = previous FP, [FP+4] = saved LR
+                let mut buf = [0u8; 8];
+                match core.read(current_fp as u64, &mut buf) {
+                    Ok(_) => {
+                        let prev_fp = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        let saved_lr = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+                        if !is_valid_code_address(saved_lr) || !is_valid_ram_address(prev_fp) {
+                            fp_walk_ok = false;
+                        } else if prev_fp == 0 || prev_fp == current_fp {
+                            // End of chain
+                            let sym = sym_table.as_ref().and_then(|t| t.resolve(saved_lr as u64));
+                            frames.push(format_stack_frame(frame_idx, saved_lr, sym.as_ref()));
+                            fp_walk_ok = false;
+                        } else {
+                            let sym = sym_table.as_ref().and_then(|t| t.resolve(saved_lr as u64));
+                            frames.push(format_stack_frame(frame_idx, saved_lr, sym.as_ref()));
+                            current_fp = prev_fp;
+                            frame_idx += 1;
+                        }
+                    }
+                    Err(_) => { fp_walk_ok = false; }
+                }
+            }
+
+            // If FP walk yielded few frames, try heuristic stack scanning
+            let fp_frames = frames.len();
+            if fp_frames < 4 && frames.len() < max_frames {
+                // Scan stack for code-like addresses
+                let scan_size = std::cmp::min(512, max_frames * 4) as usize;
+                let mut stack_buf = vec![0u8; scan_size];
+                if core.read(sp as u64, &mut stack_buf).is_ok() {
+                    for i in (0..stack_buf.len()).step_by(4) {
+                        if i + 4 > stack_buf.len() { break; }
+                        let word = u32::from_le_bytes([
+                            stack_buf[i], stack_buf[i + 1], stack_buf[i + 2], stack_buf[i + 3]
+                        ]);
+                        if is_valid_code_address(word) && word != pc && word != lr {
+                            let sym = sym_table.as_ref().and_then(|t| t.resolve(word as u64));
+                            frames.push(format!("  #{:<3} 0x{:08X} [heuristic, SP+0x{:X}]{}",
+                                frames.len(), word, i,
+                                sym.map(|s| format!(" in {}", s)).unwrap_or_default()));
+                            if frames.len() >= max_frames { break; }
+                        }
+                    }
+                }
+            }
+
+            let mut result = format!("Stack Trace ({} frames):\n\n", frames.len());
+            for frame in &frames {
+                result.push_str(frame);
+                result.push('\n');
+            }
+
+            result.push_str(&format!("\nRegisters: PC=0x{:08X} SP=0x{:08X} LR=0x{:08X} FP(R7)=0x{:08X}\n", pc, sp, lr, fp));
+            if fp_frames <= 2 {
+                result.push_str("Note: Frame pointer chain was short. Heuristic frames may be unreliable.\n");
+                result.push_str("Hint: Build with -fno-omit-frame-pointer for reliable stack traces.\n");
+            }
+
+            Ok(CallToolResult::success(vec![Content::text(result)]))
+        }
+    }
+
+    #[tool(description = "Set a data watchpoint (halt on memory read/write) using ARM Cortex-M DWT. Supports ARMv7-M (Cortex-M3/M4/M7). Returns comparator index for clearing.")]
+    async fn set_watchpoint(&self, Parameters(args): Parameters<SetWatchpointArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Setting watchpoint for session: {}", args.session_id);
+
+        let address = parse_address(&args.address).map_err(|e| {
+            McpError::internal_error(format!("Invalid address: {}", e), None)
+        })? as u32;
+
+        let mask = dwt_mask_encoding(args.size).map_err(|e| {
+            McpError::internal_error(e, None)
+        })?;
+
+        let function = dwt_function_encoding(&args.access).map_err(|e| {
+            McpError::internal_error(e, None)
+        })?;
+
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&args.session_id) {
+                Some(session) => session.clone(),
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("Session '{}' not found. Use 'connect' first.", args.session_id), None));
+                }
+            }
+        };
+
+        {
+            let mut session = session_arc.session.lock().await;
+            let mut core = match session.core(0) {
+                Ok(core) => core,
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core: {}", e), None));
+                }
+            };
+
+            // Read DWT_CTRL to get number of comparators
+            let dwt_ctrl = core.read_word_32(0xE0001000)
+                .map_err(|e| McpError::internal_error(format!("Failed to read DWT_CTRL: {}. This may not be an ARMv7-M device.", e), None))?;
+            let num_comp = (dwt_ctrl >> 28) & 0xF;
+
+            // Find a free comparator (FUNCTION == 0)
+            let mut free_index: Option<u32> = None;
+            for i in 0..num_comp {
+                let func_val = core.read_word_32(dwt_func_addr(i) as u64)
+                    .map_err(|e| McpError::internal_error(format!("Failed to read DWT_FUNCTION{}: {}", i, e), None))?;
+                if func_val & 0xF == 0 {
+                    free_index = Some(i);
+                    break;
+                }
+            }
+
+            let index = free_index.ok_or_else(|| {
+                McpError::internal_error(
+                    format!("No free DWT comparators. Device has {} comparators, all in use. Clear one first.", num_comp), None)
+            })?;
+
+            // Program the comparator
+            core.write_word_32(dwt_comp_addr(index), address)
+                .map_err(|e| McpError::internal_error(format!("Failed to write DWT_COMP{}: {}", index, e), None))?;
+            core.write_word_32(dwt_mask_addr(index), mask)
+                .map_err(|e| McpError::internal_error(format!("Failed to write DWT_MASK{}: {}", index, e), None))?;
+            core.write_word_32(dwt_func_addr(index), function)
+                .map_err(|e| McpError::internal_error(format!("Failed to write DWT_FUNCTION{}: {}", index, e), None))?;
+
+            let message = format!(
+                "Watchpoint set successfully.\n\n\
+                Comparator: {}\n\
+                Address:    0x{:08X}\n\
+                Size:       {} byte(s)\n\
+                Access:     {}\n\n\
+                The target will halt when the watched address is accessed.\n\
+                Use clear_watchpoint with index {} to remove.",
+                index, address, args.size, args.access, index
+            );
+            Ok(CallToolResult::success(vec![Content::text(message)]))
+        }
+    }
+
+    #[tool(description = "Clear a data watchpoint by DWT comparator index (0-3).")]
+    async fn clear_watchpoint(&self, Parameters(args): Parameters<ClearWatchpointArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Clearing watchpoint {} for session: {}", args.index, args.session_id);
+
+        if args.index > 3 {
+            return Err(McpError::internal_error(
+                format!("Invalid comparator index {}. Valid range: 0-3.", args.index), None));
+        }
+
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&args.session_id) {
+                Some(session) => session.clone(),
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("Session '{}' not found. Use 'connect' first.", args.session_id), None));
+                }
+            }
+        };
+
+        {
+            let mut session = session_arc.session.lock().await;
+            let mut core = match session.core(0) {
+                Ok(core) => core,
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core: {}", e), None));
+                }
+            };
+
+            // Write 0 to DWT_FUNCTION to disable
+            core.write_word_32(dwt_func_addr(args.index), 0u32)
+                .map_err(|e| McpError::internal_error(format!("Failed to clear DWT_FUNCTION{}: {}", args.index, e), None))?;
+
+            let message = format!(
+                "Watchpoint {} cleared successfully.\n\nDWT comparator {} is now free.",
+                args.index, args.index
+            );
+            Ok(CallToolResult::success(vec![Content::text(message)]))
+        }
+    }
+
+    #[tool(description = "Dump registers and RAM to file. With elf_path: GDB-compatible ELF core dump. Without: raw JSON + binary dump. Target must be halted.")]
+    async fn core_dump(&self, Parameters(args): Parameters<CoreDumpArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Creating core dump for session: {}", args.session_id);
+
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&args.session_id) {
+                Some(session) => session.clone(),
+                None => {
+                    return Err(McpError::internal_error(
+                        format!("Session '{}' not found. Use 'connect' first.", args.session_id), None));
+                }
+            }
+        };
+
+        {
+            let mut session = session_arc.session.lock().await;
+            // Get memory map before borrowing core (avoids borrow conflict)
+            let memory_map = session.target().memory_map.clone();
+
+            let mut core = match session.core(0) {
+                Ok(core) => core,
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core: {}", e), None));
+                }
+            };
+
+            // Verify halted
+            match core.status() {
+                Ok(CoreStatus::Halted(_)) => {},
+                Ok(_) => {
+                    return Err(McpError::internal_error(
+                        "Target must be halted for core dump. Use 'halt' first.".to_string(), None));
+                }
+                Err(e) => {
+                    return Err(McpError::internal_error(format!("Failed to get core status: {}", e), None));
+                }
+            }
+
+            // Read all registers: R0-R12, SP, LR, PC, xPSR
+            let reg_names = [
+                "R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7",
+                "R8", "R9", "R10", "R11", "R12",
+            ];
+            let mut reg_values = [0u32; 17];
+            let mut named_regs: Vec<(String, u32)> = Vec::new();
+
+            // Read R0-R12 from core registers
+            {
+                let registers = core.registers();
+                let reg_info: Vec<(&str, probe_rs::RegisterId)> = registers
+                    .core_registers()
+                    .map(|r| (r.name(), r.id()))
+                    .collect();
+                for (name, id) in &reg_info {
+                    let name_upper = name.to_uppercase();
+                    for (i, rn) in reg_names.iter().enumerate() {
+                        if name_upper == *rn {
+                            if let Ok(v) = core.read_core_reg::<u32>(*id) {
+                                reg_values[i] = v;
+                                named_regs.push((rn.to_string(), v));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Read SP, LR, PC
+            let sp = core.read_core_reg(core.stack_pointer())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+            let lr = core.read_core_reg(core.return_address())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+            let pc = core.read_core_reg(core.program_counter())
+                .map(|v: RegisterValue| -> u32 { v.try_into().unwrap_or(0) }).unwrap_or(0);
+
+            reg_values[13] = sp;
+            reg_values[14] = lr;
+            reg_values[15] = pc;
+            named_regs.push(("SP".to_string(), sp));
+            named_regs.push(("LR".to_string(), lr));
+            named_regs.push(("PC".to_string(), pc));
+
+            // Try xPSR
+            {
+                let all_regs = core.registers();
+                let reg_info: Vec<(&str, probe_rs::RegisterId)> = all_regs
+                    .core_registers()
+                    .map(|r| (r.name(), r.id()))
+                    .collect();
+                for (name, id) in &reg_info {
+                    let name_upper = name.to_uppercase();
+                    if name_upper.contains("XPSR") || name_upper.contains("PSR") {
+                        if let Ok(v) = core.read_core_reg::<u32>(*id) {
+                            reg_values[16] = v;
+                            named_regs.push(("xPSR".to_string(), v));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Read RAM regions from memory map
+            let mut ram_regions: Vec<(String, u64, Vec<u8>)> = Vec::new();
+            let mut elf_regions: Vec<(u64, Vec<u8>)> = Vec::new();
+
+            for region in &memory_map {
+                if let probe_rs::config::MemoryRegion::Ram(ram) = region {
+                    let base = ram.range.start;
+                    let size = (ram.range.end - ram.range.start) as usize;
+                    // Cap at 256KB per region to avoid extremely long reads
+                    let read_size = std::cmp::min(size, 256 * 1024);
+                    let mut data = vec![0u8; read_size];
+                    match core.read(base, &mut data) {
+                        Ok(_) => {
+                            let name = ram.name.as_deref().unwrap_or("ram").to_string();
+                            ram_regions.push((name, base, data.clone()));
+                            elf_regions.push((base, data));
+                        }
+                        Err(e) => {
+                            warn!("Failed to read RAM region at 0x{:08X}: {}", base, e);
+                        }
+                    }
+                }
+            }
+
+            if args.elf_path.is_some() {
+                // ELF core dump
+                let regions_ref: Vec<(u64, &[u8])> = elf_regions.iter()
+                    .map(|(addr, data)| (*addr, data.as_slice()))
+                    .collect();
+
+                let mut file = std::fs::File::create(&args.output_path)
+                    .map_err(|e| McpError::internal_error(format!("Failed to create output file: {}", e), None))?;
+
+                crate::coredump::write_elf_coredump(&mut file, &reg_values, &regions_ref)
+                    .map_err(|e| McpError::internal_error(format!("Failed to write core dump: {}", e), None))?;
+
+                let total_ram: usize = elf_regions.iter().map(|(_, d)| d.len()).sum();
+                let message = format!(
+                    "ELF core dump saved to {}\n\n\
+                    Format: ELF32 ARM core dump (GDB compatible)\n\
+                    Registers: 17 (R0-R12, SP, LR, PC, xPSR)\n\
+                    RAM regions: {}\n\
+                    Total RAM dumped: {} bytes\n\n\
+                    Load with: arm-none-eabi-gdb <firmware.elf> -c {}\n",
+                    args.output_path, elf_regions.len(), total_ram, args.output_path
+                );
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            } else {
+                // Raw dump
+                crate::coredump::write_raw_coredump(&args.output_path, &named_regs, &ram_regions)
+                    .map_err(|e| McpError::internal_error(format!("Failed to write raw dump: {}", e), None))?;
+
+                let total_ram: usize = ram_regions.iter().map(|(_, _, d)| d.len()).sum();
+                let message = format!(
+                    "Raw core dump saved.\n\n\
+                    Manifest: {}.json\n\
+                    Region files: {} binary files\n\
+                    Registers: {}\n\
+                    Total RAM dumped: {} bytes\n",
+                    args.output_path, ram_regions.len(), named_regs.len(), total_ram
+                );
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            }
+        }
+    }
+
+    #[tool(description = "Start a GDB server (probe-rs gdb) for connecting with arm-none-eabi-gdb or other GDB clients. Important: disconnect any active debug session on the same probe first, as the GDB server opens its own probe connection.")]
+    async fn gdb_server(&self, Parameters(args): Parameters<GdbServerArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Starting GDB server for chip {} on port {}", args.target_chip, args.port);
+
+        // Check if port is already in use by us
+        {
+            let processes = self.gdb_processes.read().await;
+            if processes.contains_key(&args.port) {
+                return Err(McpError::internal_error(
+                    format!("GDB server already running on port {}. Disconnect it first or use a different port.", args.port), None));
+            }
+        }
+
+        let mut cmd = tokio::process::Command::new("probe-rs");
+        cmd.arg("gdb")
+            .arg("--chip").arg(&args.target_chip)
+            .arg("--port").arg(args.port.to_string());
+
+        if args.probe_selector != "auto" {
+            cmd.arg("--probe").arg(&args.probe_selector);
+        }
+
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let child = cmd.spawn().map_err(|e| {
+            McpError::internal_error(
+                format!("Failed to start probe-rs gdb: {}\n\nMake sure probe-rs is installed: cargo install probe-rs-tools", e), None)
+        })?;
+
+        // Wait briefly to check process is alive
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Store the process
+        let port = args.port;
+        {
+            let mut processes = self.gdb_processes.write().await;
+            processes.insert(port, Arc::new(tokio::sync::Mutex::new(child)));
+        }
+
+        let mut message = format!(
+            "GDB server started on port {}.\n\n\
+            Target chip: {}\n\
+            Connect with:\n  arm-none-eabi-gdb <firmware.elf> -ex \"target remote :{}\"\n",
+            port, args.target_chip, port
+        );
+
+        if let Some(ref elf_path) = args.elf_path {
+            message.push_str(&format!(
+                "\nWith your ELF:\n  arm-none-eabi-gdb {} -ex \"target remote :{}\"\n",
+                elf_path, port
+            ));
+        }
+
+        message.push_str("\nNote: The GDB server holds the probe connection. Disconnect any active debug sessions on the same probe.");
+
+        Ok(CallToolResult::success(vec![Content::text(message)]))
+    }
+}
+
+// =============================================================================
+// DWT Watchpoint Helpers
+// =============================================================================
+
+fn dwt_comp_addr(index: u32) -> u64 { 0xE0001020 + (index as u64) * 0x10 }
+fn dwt_mask_addr(index: u32) -> u64 { 0xE0001024 + (index as u64) * 0x10 }
+fn dwt_func_addr(index: u32) -> u64 { 0xE0001028 + (index as u64) * 0x10 }
+
+fn dwt_function_encoding(access: &str) -> Result<u32, String> {
+    match access {
+        "read" => Ok(5),
+        "write" => Ok(6),
+        "readwrite" => Ok(7),
+        _ => Err(format!("Invalid access type '{}'. Use 'read', 'write', or 'readwrite'.", access)),
+    }
+}
+
+fn dwt_mask_encoding(size: u32) -> Result<u32, String> {
+    match size {
+        1 => Ok(0),
+        2 => Ok(1),
+        4 => Ok(2),
+        _ => Err(format!("Invalid watchpoint size {}. Must be 1, 2, or 4 bytes.", size)),
+    }
+}
+
+// =============================================================================
+// Stack Trace Helpers
+// =============================================================================
+
+/// Check if an address looks like valid Thumb code (odd, in flash range).
+fn is_valid_code_address(addr: u32) -> bool {
+    // Must be odd (Thumb bit set) and in typical flash range 0x00000000-0x1FFFFFFF
+    // or upper flash aliases
+    (addr & 1) != 0 && addr >= 0x00000001 && addr < 0x20000000
+}
+
+/// Check if an address is in the typical ARM RAM range.
+fn is_valid_ram_address(addr: u32) -> bool {
+    addr >= 0x20000000 && addr < 0x30000000
+}
+
+fn format_stack_frame(index: usize, addr: u32, symbol: Option<&crate::symbols::resolver::ResolvedSymbol>) -> String {
+    match symbol {
+        Some(sym) => format!("  #{:<3} 0x{:08X} in {}", index, addr, sym),
+        None => format!("  #{:<3} 0x{:08X}", index, addr),
+    }
 }
 
 // =============================================================================
@@ -2232,7 +2965,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, RTT communication, and flash programming with real hardware integration. All 27 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, load_custom_target.".to_string()),
+            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, GDB server, RTT communication, and flash programming with real hardware integration. All 35 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, load_custom_target.".to_string()),
         }
     }
 
@@ -2241,7 +2974,107 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Complete Embedded Debugger MCP server initialized with all 27 tools");
+        info!("Complete Embedded Debugger MCP server initialized with all 35 tools");
         Ok(self.get_info())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // DWT address tests
+    #[test]
+    fn test_dwt_comp_addresses() {
+        assert_eq!(dwt_comp_addr(0), 0xE0001020);
+        assert_eq!(dwt_comp_addr(1), 0xE0001030);
+        assert_eq!(dwt_comp_addr(2), 0xE0001040);
+        assert_eq!(dwt_comp_addr(3), 0xE0001050);
+    }
+
+    #[test]
+    fn test_dwt_mask_addresses() {
+        assert_eq!(dwt_mask_addr(0), 0xE0001024);
+        assert_eq!(dwt_mask_addr(1), 0xE0001034);
+        assert_eq!(dwt_mask_addr(2), 0xE0001044);
+        assert_eq!(dwt_mask_addr(3), 0xE0001054);
+    }
+
+    #[test]
+    fn test_dwt_func_addresses() {
+        assert_eq!(dwt_func_addr(0), 0xE0001028);
+        assert_eq!(dwt_func_addr(1), 0xE0001038);
+        assert_eq!(dwt_func_addr(2), 0xE0001048);
+        assert_eq!(dwt_func_addr(3), 0xE0001058);
+    }
+
+    #[test]
+    fn test_function_encoding_read() {
+        assert_eq!(dwt_function_encoding("read").unwrap(), 5);
+    }
+
+    #[test]
+    fn test_function_encoding_write() {
+        assert_eq!(dwt_function_encoding("write").unwrap(), 6);
+    }
+
+    #[test]
+    fn test_function_encoding_readwrite() {
+        assert_eq!(dwt_function_encoding("readwrite").unwrap(), 7);
+    }
+
+    #[test]
+    fn test_function_encoding_invalid() {
+        assert!(dwt_function_encoding("foo").is_err());
+    }
+
+    #[test]
+    fn test_mask_encoding_1_2_4() {
+        assert_eq!(dwt_mask_encoding(1).unwrap(), 0);
+        assert_eq!(dwt_mask_encoding(2).unwrap(), 1);
+        assert_eq!(dwt_mask_encoding(4).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_mask_encoding_invalid_size() {
+        assert!(dwt_mask_encoding(3).is_err());
+        assert!(dwt_mask_encoding(8).is_err());
+        assert!(dwt_mask_encoding(0).is_err());
+    }
+
+    // Stack trace helper tests
+    #[test]
+    fn test_valid_thumb_address() {
+        assert!(is_valid_code_address(0x08000001)); // odd, in flash range
+    }
+
+    #[test]
+    fn test_even_address_not_thumb() {
+        assert!(!is_valid_code_address(0x08000000)); // even
+    }
+
+    #[test]
+    fn test_ram_address_not_code() {
+        assert!(!is_valid_code_address(0x20000001)); // in RAM, not flash
+    }
+
+    #[test]
+    fn test_null_address() {
+        assert!(!is_valid_code_address(0x00000000));
+    }
+
+    #[test]
+    fn test_valid_ram_address() {
+        assert!(is_valid_ram_address(0x20001000));
+    }
+
+    #[test]
+    fn test_peripheral_not_ram() {
+        assert!(!is_valid_ram_address(0x40000000));
+    }
+
+    #[test]
+    fn test_zero_not_ram() {
+        assert!(!is_valid_ram_address(0x00000000));
     }
 }

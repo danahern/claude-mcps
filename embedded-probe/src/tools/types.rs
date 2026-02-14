@@ -480,3 +480,96 @@ pub struct LoadCustomTargetArgs {
     /// Path to target YAML file (probe-rs format)
     pub target_file_path: String,
 }
+
+// =============================================================================
+// Advanced Debugging Types
+// =============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadRegistersArgs {
+    /// Session ID
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteRegisterArgs {
+    /// Session ID
+    pub session_id: String,
+    /// Register name (e.g., "R0", "SP", "LR", "PC", "xPSR", "R7")
+    pub register: String,
+    /// Value to write (hex string like "0xDEADBEEF" or decimal)
+    pub value: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ResolveSymbolArgs {
+    /// Memory address to resolve (hex string like "0x8001234" or decimal)
+    pub address: String,
+    /// Path to ELF file containing symbols
+    pub elf_path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StackTraceArgs {
+    /// Session ID
+    pub session_id: String,
+    /// Path to ELF file for symbol resolution (optional)
+    pub elf_path: Option<String>,
+    /// Maximum number of stack frames to collect
+    #[serde(default = "default_max_frames")]
+    pub max_frames: u32,
+}
+
+fn default_max_frames() -> u32 { 32 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetWatchpointArgs {
+    /// Session ID
+    pub session_id: String,
+    /// Memory address to watch (hex string like "0x20000000" or decimal)
+    pub address: String,
+    /// Size of watched region in bytes: 1, 2, or 4
+    #[serde(default = "default_watchpoint_size")]
+    pub size: u32,
+    /// Access type: "read", "write", or "readwrite"
+    #[serde(default = "default_watchpoint_access")]
+    pub access: String,
+}
+
+fn default_watchpoint_size() -> u32 { 4 }
+fn default_watchpoint_access() -> String { "readwrite".to_string() }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ClearWatchpointArgs {
+    /// Session ID
+    pub session_id: String,
+    /// DWT comparator index (0-3) returned by set_watchpoint
+    pub index: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CoreDumpArgs {
+    /// Session ID
+    pub session_id: String,
+    /// Output file path for the core dump
+    pub output_path: String,
+    /// Path to ELF file — if provided, produces GDB-compatible ELF core dump; otherwise raw dump
+    pub elf_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GdbServerArgs {
+    /// Target chip name (e.g., "nRF52840_xxAA", "STM32F407VGTx")
+    pub target_chip: String,
+    /// Probe selector (serial number, identifier, or "auto" for first available)
+    #[serde(default = "default_probe_selector")]
+    pub probe_selector: String,
+    /// GDB server port number
+    #[serde(default = "default_gdb_port")]
+    pub port: u16,
+    /// Path to ELF file for symbol information (optional)
+    pub elf_path: Option<String>,
+}
+
+fn default_probe_selector() -> String { "auto".to_string() }
+fn default_gdb_port() -> u16 { 1337 }

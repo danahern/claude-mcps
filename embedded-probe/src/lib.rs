@@ -11,6 +11,8 @@ pub mod debugger;
 pub mod rtt;
 pub mod flash;
 pub mod tools;
+pub mod symbols;
+pub mod coredump;
 
 pub use error::{DebugError, Result};
 pub use config::Config;
