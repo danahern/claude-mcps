@@ -38,8 +38,24 @@ Quick "biggest files/symbols" view. Flattens the tree and sorts by size.
 ## Key Details
 
 - Runs `python3 size_report` as a subprocess
+- **CRITICAL**: Must pass `rom ram` as separate targets, NOT `all`. The `all` target generates one combined file.
 - Requires Zephyr workspace with `zephyr/scripts/footprint/size_report`
 - Python deps: `pyelftools`, `anytree`, `colorama`, `packaging`
 - ELF must contain DWARF debug info for file-level attribution
 - JSON output from size_report uses `identifier` for full paths, `name` for display — we map `identifier` to `SizeNode.name`
 - `compare_sizes` flattens both trees to leaf level for accurate per-file deltas
+- `std::mem::forget(tmpdir)` keeps temp files alive for the caller — acceptable for short-lived MCP calls
+
+## Source Layout
+
+```
+src/
+├── main.rs          # Entry point, logging init
+├── lib.rs           # Public exports
+├── config.rs        # CLI args (clap) + Config struct
+└── tools/
+    ├── mod.rs       # Module exports
+    ├── types.rs     # All arg/result/JSON deserialization structs
+    ├── handler.rs   # Tool router + handler (3 tools)
+    └── size_report.rs  # Subprocess exec, JSON parsing, tree ops
+```

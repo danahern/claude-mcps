@@ -115,7 +115,7 @@ impl ElfAnalysisToolHandler {
         let targets: Vec<&str> = match target {
             "rom" => vec!["rom"],
             "ram" => vec!["ram"],
-            _ => vec!["all"],
+            _ => vec!["rom", "ram"],
         };
 
         info!("analyze_size: {} target={}", elf_path.display(), target);
@@ -167,8 +167,8 @@ impl ElfAnalysisToolHandler {
         info!("compare_sizes: {} vs {}", elf_a.display(), elf_b.display());
 
         let ws = args.workspace_path.as_deref();
-        let (rom_a, ram_a) = self.run_and_parse(&elf_a, ws, &["all"]).await?;
-        let (rom_b, ram_b) = self.run_and_parse(&elf_b, ws, &["all"]).await?;
+        let (rom_a, ram_a) = self.run_and_parse(&elf_a, ws, &["rom", "ram"]).await?;
+        let (rom_b, ram_b) = self.run_and_parse(&elf_b, ws, &["rom", "ram"]).await?;
 
         let rom_delta = match (rom_a, rom_b) {
             (Some(a), Some(b)) => {

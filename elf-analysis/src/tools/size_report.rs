@@ -66,19 +66,9 @@ pub async fn run_size_report(
     // Collect the generated JSON files
     let mut results = HashMap::new();
     for t in targets {
-        if *t == "all" {
-            // "all" generates both rom.json and ram.json
-            for sub in &["rom", "ram"] {
-                let json_path = tmpdir.path().join(format!("{}.json", sub));
-                if json_path.exists() {
-                    results.insert(sub.to_string(), json_path);
-                }
-            }
-        } else {
-            let json_path = tmpdir.path().join(format!("{}.json", t));
-            if json_path.exists() {
-                results.insert(t.to_string(), json_path);
-            }
+        let json_path = tmpdir.path().join(format!("{}.json", t));
+        if json_path.exists() {
+            results.insert(t.to_string(), json_path);
         }
     }
 
