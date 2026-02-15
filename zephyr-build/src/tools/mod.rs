@@ -4,6 +4,7 @@
 //! using the RMCP 0.3.2 API patterns.
 
 pub mod build_tools;
+pub mod templates;
 pub mod types;
 
 pub use build_tools::*;

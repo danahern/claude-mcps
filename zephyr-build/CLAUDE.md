@@ -15,11 +15,13 @@ Set `workspace_path` in config or pass per-call. Points to the directory contain
 ## Tools
 
 ### Build
-- `list_apps` — Scan workspace for Zephyr applications (directories with CMakeLists.txt)
+- `list_apps` — Scan workspace for Zephyr applications (directories with CMakeLists.txt). Reads `manifest.yml` for description, boards, libraries.
 - `list_boards` — List supported boards. Fast mode returns common boards; `include_all=true` runs `west boards` (slow)
 - `build` — Build an app for a target board. Supports `pristine=true` for clean builds and `background=true` for async
 - `build_status` — Check progress of a background build
 - `clean` — Remove build artifacts for an app
+- `list_templates` — List available app templates with descriptions, default libraries, and generated files. Call before `create_app`.
+- `create_app` — Create a new app from a template. Args: `name` (required), `template` (default "core"), `board`, `libraries`, `description`. Reads library manifests to generate OVERLAY_CONFIG lines.
 
 ### Test
 - `run_tests` — Run Zephyr tests via twister. Supports `path` filter, `board`, `filter` (-k), `background` mode. Returns parsed summary.
@@ -35,3 +37,5 @@ Set `workspace_path` in config or pass per-call. Points to the directory contain
 - Test tools run `python3 zephyr/scripts/twister` and parse `twister.json` output
 - Test output goes to `.cache/twister/<test_id>/`
 - Default test path is `lib/` under the apps parent directory
+- Library manifests (`lib/<name>/manifest.yml`) declare `default_overlays` used by `create_app`
+- App manifests (`apps/<name>/manifest.yml`) store description, boards, libraries, template metadata

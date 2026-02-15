@@ -29,6 +29,15 @@ pub struct AppInfo {
     pub has_build: bool,
     /// Board from last build (if available)
     pub board: Option<String>,
+    /// Description from manifest.yml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Target boards from manifest.yml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_boards: Option<Vec<String>>,
+    /// Libraries from manifest.yml
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub libraries: Option<Vec<String>>,
 }
 
 // ============================================================================
@@ -308,4 +317,91 @@ pub struct TestFailure {
     pub test_name: Option<String>,
     pub platform: String,
     pub log: String,
+}
+
+// ============================================================================
+// list_templates
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListTemplatesArgs {}
+
+#[derive(Debug, Serialize)]
+pub struct ListTemplatesResult {
+    pub templates: Vec<TemplateInfo>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TemplateInfo {
+    /// Template name (e.g., "core")
+    pub name: String,
+    /// What this template provides
+    pub description: String,
+    /// Libraries included by default
+    pub default_libraries: Vec<String>,
+    /// Files that will be generated
+    pub files: Vec<String>,
+}
+
+// ============================================================================
+// create_app
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateAppArgs {
+    /// Application name (lowercase alphanumeric + underscore)
+    pub name: String,
+    /// Template to use (defaults to "core")
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Default target board
+    #[serde(default)]
+    pub board: Option<String>,
+    /// Additional libraries beyond template defaults
+    #[serde(default)]
+    pub libraries: Option<Vec<String>>,
+    /// One-line description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Override workspace path
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAppResult {
+    pub success: bool,
+    pub app_name: String,
+    pub app_path: String,
+    pub files_created: Vec<String>,
+    pub message: String,
+}
+
+// ============================================================================
+// manifests
+// ============================================================================
+
+/// Library manifest (lib/<name>/manifest.yml)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub default_overlays: Vec<String>,
+    #[serde(default)]
+    pub board_overlays: bool,
+    #[serde(default)]
+    pub depends: Vec<String>,
+}
+
+/// App manifest (apps/<name>/manifest.yml)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppManifest {
+    pub description: String,
+    #[serde(default)]
+    pub boards: Vec<String>,
+    #[serde(default)]
+    pub libraries: Vec<String>,
+    #[serde(default)]
+    pub template: Option<String>,
 }

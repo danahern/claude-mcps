@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 use tokio::process::Command;
 
 use super::types::*;
+use super::templates;
 use crate::config::Config;
 
 /// Get home directory path
@@ -233,6 +234,36 @@ impl ZephyrBuildToolHandler {
             None,
         ))
     }
+
+    /// Get lib directory path (sibling of apps dir)
+    fn get_lib_dir(&self, workspace: &Path) -> PathBuf {
+        let apps_dir = self.get_apps_dir(workspace);
+        apps_dir.parent().unwrap_or(&apps_dir).join("lib")
+    }
+
+    /// Read a library manifest from lib/<name>/manifest.yml
+    fn read_library_manifest(&self, workspace: &Path, lib_name: &str) -> Result<LibraryManifest, McpError> {
+        let manifest_path = self.get_lib_dir(workspace).join(lib_name).join("manifest.yml");
+        let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            McpError::invalid_params(
+                format!("Cannot read library manifest {}: {}", manifest_path.display(), e),
+                None,
+            )
+        })?;
+        serde_yaml::from_str(&content).map_err(|e| {
+            McpError::internal_error(
+                format!("Invalid library manifest {}: {}", manifest_path.display(), e),
+                None,
+            )
+        })
+    }
+
+    /// Read an app manifest from apps/<name>/manifest.yml (returns None if missing)
+    fn read_app_manifest(app_path: &Path) -> Option<AppManifest> {
+        let manifest_path = app_path.join("manifest.yml");
+        let content = std::fs::read_to_string(&manifest_path).ok()?;
+        serde_yaml::from_str(&content).ok()
+    }
 }
 
 impl Default for ZephyrBuildToolHandler {
@@ -304,11 +335,20 @@ impl ZephyrBuildToolHandler {
                         .to_string_lossy()
                         .to_string();
 
+                    let manifest = Self::read_app_manifest(&path);
+
                     apps.push(AppInfo {
                         name,
                         path: rel_path,
                         has_build,
                         board,
+                        description: manifest.as_ref().map(|m| m.description.clone()),
+                        target_boards: manifest.as_ref().and_then(|m| {
+                            if m.boards.is_empty() { None } else { Some(m.boards.clone()) }
+                        }),
+                        libraries: manifest.as_ref().and_then(|m| {
+                            if m.libraries.is_empty() { None } else { Some(m.libraries.clone()) }
+                        }),
                     });
                 }
             }
@@ -703,6 +743,172 @@ impl ZephyrBuildToolHandler {
         })?;
 
         info!("Clean result: {}", result.message);
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "List available app templates. Call this before create_app to see what templates exist and what they include.")]
+    async fn list_templates(&self, Parameters(_args): Parameters<ListTemplatesArgs>) -> Result<CallToolResult, McpError> {
+        let result = ListTemplatesResult {
+            templates: vec![
+                TemplateInfo {
+                    name: "core".to_string(),
+                    description: "Foundation template with shell + crash debug. Includes RTT logging, \
+                                  coredump detection, and device shell commands out of the box."
+                        .to_string(),
+                    default_libraries: vec!["crash_log".to_string(), "device_shell".to_string()],
+                    files: vec![
+                        "CMakeLists.txt".to_string(),
+                        "prj.conf".to_string(),
+                        "manifest.yml".to_string(),
+                        "src/main.c".to_string(),
+                    ],
+                },
+            ],
+        };
+
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Create a new Zephyr application from a template")]
+    async fn create_app(&self, Parameters(args): Parameters<CreateAppArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Creating app '{}'", args.name);
+
+        // Validate name: lowercase alphanumeric + underscore
+        if args.name.is_empty() || !args.name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return Err(McpError::invalid_params(
+                format!("Invalid app name '{}': must be lowercase alphanumeric + underscore", args.name),
+                None,
+            ));
+        }
+
+        let template = args.template.as_deref().unwrap_or("core");
+        if template != "core" {
+            return Err(McpError::invalid_params(
+                format!("Unknown template '{}'. Available: core", template),
+                None,
+            ));
+        }
+
+        let workspace = self.find_workspace(args.workspace_path.as_deref())?;
+        let apps_dir = self.get_apps_dir(&workspace);
+        let app_dir = apps_dir.join(&args.name);
+
+        if app_dir.exists() {
+            return Err(McpError::invalid_params(
+                format!("App '{}' already exists at {}", args.name, app_dir.display()),
+                None,
+            ));
+        }
+
+        // Core template default libraries
+        let mut all_libs = vec!["crash_log".to_string(), "device_shell".to_string()];
+        if let Some(extra) = &args.libraries {
+            for lib in extra {
+                if !all_libs.contains(lib) {
+                    all_libs.push(lib.clone());
+                }
+            }
+        }
+
+        // Read library manifests to build OVERLAY_CONFIG lines
+        let lib_dir = self.get_lib_dir(&workspace);
+        let mut overlay_lines = Vec::new();
+        for lib_name in &all_libs {
+            match self.read_library_manifest(&workspace, lib_name) {
+                Ok(manifest) => {
+                    for overlay in &manifest.default_overlays {
+                        overlay_lines.push(format!(
+                            "list(APPEND OVERLAY_CONFIG \"${{CMAKE_CURRENT_LIST_DIR}}/../../lib/{}/{}\")",
+                            lib_name, overlay
+                        ));
+                    }
+                }
+                Err(_) => {
+                    // Library exists but no manifest — check if the lib dir exists at all
+                    if !lib_dir.join(lib_name).exists() {
+                        return Err(McpError::invalid_params(
+                            format!("Library '{}' not found in {}", lib_name, lib_dir.display()),
+                            None,
+                        ));
+                    }
+                    // No manifest, skip overlay generation for this lib
+                }
+            }
+        }
+
+        let overlay_block = overlay_lines.join("\n");
+
+        let description = args.description.as_deref().unwrap_or(&args.name);
+        let board = args.board.as_deref().unwrap_or("nrf52840dk/nrf52840");
+
+        // Render templates
+        let cmake_content = templates::render(templates::TEMPLATE_CMAKE, &[
+            ("APP_NAME", &args.name),
+            ("OVERLAY_LINES", &overlay_block),
+        ]);
+
+        let main_c_content = templates::render(templates::TEMPLATE_MAIN_C, &[
+            ("APP_NAME", &args.name),
+        ]);
+
+        // Build manifest YAML lines
+        let board_lines = format!("  - {}", board);
+        let library_lines = all_libs.iter()
+            .map(|l| format!("  - {}", l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let manifest_content = templates::render(templates::TEMPLATE_MANIFEST, &[
+            ("DESCRIPTION", description),
+            ("BOARD_LINES", &board_lines),
+            ("LIBRARY_LINES", &library_lines),
+            ("TEMPLATE", template),
+        ]);
+
+        // Create directories and write files
+        let src_dir = app_dir.join("src");
+        std::fs::create_dir_all(&src_dir).map_err(|e| {
+            McpError::internal_error(format!("Failed to create {}: {}", src_dir.display(), e), None)
+        })?;
+
+        let files = vec![
+            ("CMakeLists.txt", cmake_content),
+            ("prj.conf", templates::TEMPLATE_PRJ_CONF.to_string()),
+            ("manifest.yml", manifest_content),
+            ("src/main.c", main_c_content),
+        ];
+
+        let mut created = Vec::new();
+        for (rel_path, content) in &files {
+            let full_path = app_dir.join(rel_path);
+            std::fs::write(&full_path, content).map_err(|e| {
+                McpError::internal_error(format!("Failed to write {}: {}", full_path.display(), e), None)
+            })?;
+            created.push(rel_path.to_string());
+        }
+
+        let rel_app_path = app_dir.strip_prefix(&workspace)
+            .unwrap_or(&app_dir)
+            .to_string_lossy()
+            .to_string();
+
+        let result = CreateAppResult {
+            success: true,
+            app_name: args.name.clone(),
+            app_path: rel_app_path,
+            files_created: created,
+            message: format!("Created app '{}' from '{}' template", args.name, template),
+        };
+
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        info!("Created app '{}' with {} files", args.name, result.files_created.len());
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
@@ -1903,6 +2109,280 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
+
+    // =========================================================================
+    // list_templates tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_list_templates() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .list_templates(Parameters(ListTemplatesArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let templates = parsed["templates"].as_array().unwrap();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0]["name"].as_str().unwrap(), "core");
+        let libs: Vec<&str> = templates[0]["default_libraries"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(libs.contains(&"crash_log"));
+        assert!(libs.contains(&"device_shell"));
+        let files: Vec<&str> = templates[0]["files"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(files.contains(&"src/main.c"));
+    }
+
+    // =========================================================================
+    // create_app tests
+    // =========================================================================
+
+    /// Create a workspace with lib manifests for create_app tests
+    fn setup_workspace_with_libs(tmp: &TempDir) {
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let lib_dir = tmp.path().join("zephyr-apps/lib");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        // crash_log lib with manifest
+        let crash_log = lib_dir.join("crash_log/conf");
+        fs::create_dir_all(&crash_log).unwrap();
+        fs::write(lib_dir.join("crash_log/manifest.yml"), r#"
+name: crash_log
+description: "Boot-time coredump detection"
+default_overlays:
+  - conf/debug_base.conf
+  - conf/debug_coredump_flash.conf
+board_overlays: true
+depends: []
+"#).unwrap();
+
+        // device_shell lib with manifest
+        fs::create_dir_all(lib_dir.join("device_shell")).unwrap();
+        fs::write(lib_dir.join("device_shell/manifest.yml"), r#"
+name: device_shell
+description: "Board info shell commands"
+default_overlays:
+  - device_shell.conf
+board_overlays: false
+depends: []
+"#).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_app_basic() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_libs(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "test_app".to_string(),
+                template: None,
+                board: Some("nrf52840dk/nrf52840".to_string()),
+                libraries: None,
+                description: Some("A test application".to_string()),
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+        assert_eq!(parsed["app_name"].as_str().unwrap(), "test_app");
+        let files: Vec<&str> = parsed["files_created"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(files.contains(&"CMakeLists.txt"));
+        assert!(files.contains(&"prj.conf"));
+        assert!(files.contains(&"manifest.yml"));
+        assert!(files.contains(&"src/main.c"));
+
+        // Verify files exist
+        let app_dir = tmp.path().join("zephyr-apps/apps/test_app");
+        assert!(app_dir.join("CMakeLists.txt").exists());
+        assert!(app_dir.join("prj.conf").exists());
+        assert!(app_dir.join("manifest.yml").exists());
+        assert!(app_dir.join("src/main.c").exists());
+
+        // Verify CMakeLists content includes overlays
+        let cmake = fs::read_to_string(app_dir.join("CMakeLists.txt")).unwrap();
+        assert!(cmake.contains("project(test_app)"));
+        assert!(cmake.contains("crash_log/conf/debug_base.conf"));
+        assert!(cmake.contains("device_shell/device_shell.conf"));
+
+        // Verify main.c content
+        let main_c = fs::read_to_string(app_dir.join("src/main.c")).unwrap();
+        assert!(main_c.contains("LOG_MODULE_REGISTER(test_app"));
+        assert!(main_c.contains("test_app booted"));
+
+        // Verify manifest
+        let manifest = fs::read_to_string(app_dir.join("manifest.yml")).unwrap();
+        assert!(manifest.contains("A test application"));
+        assert!(manifest.contains("nrf52840dk/nrf52840"));
+        assert!(manifest.contains("crash_log"));
+        assert!(manifest.contains("device_shell"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_invalid_name() {
+        let handler = ZephyrBuildToolHandler::default();
+
+        for name in &["", "MyApp", "has-dash", "has space", "UPPER"] {
+            let result = handler
+                .create_app(Parameters(CreateAppArgs {
+                    name: name.to_string(),
+                    template: None,
+                    board: None,
+                    libraries: None,
+                    description: None,
+                    workspace_path: Some("/tmp/fake".to_string()),
+                }))
+                .await;
+            assert!(result.is_err(), "Name '{}' should be rejected", name);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_app_already_exists() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_libs(&tmp);
+
+        // Create existing app
+        let app_dir = tmp.path().join("zephyr-apps/apps/existing_app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "existing_app".to_string(),
+                template: None,
+                board: None,
+                libraries: None,
+                description: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_app_unknown_template() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "my_app".to_string(),
+                template: Some("nonexistent".to_string()),
+                board: None,
+                libraries: None,
+                description: None,
+                workspace_path: Some("/tmp/fake".to_string()),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_app_unknown_library() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_libs(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "my_app".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["nonexistent_lib".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // list_apps manifest enrichment tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_list_apps_with_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let app = apps_dir.join("my_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(my_app)\n").unwrap();
+        fs::write(app.join("manifest.yml"), r#"
+description: "My test app"
+boards:
+  - nrf52840dk/nrf52840
+libraries:
+  - crash_log
+template: core
+"#).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_apps(Parameters(ListAppsArgs { workspace_path: None }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let apps = parsed["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0]["description"].as_str().unwrap(), "My test app");
+        let boards: Vec<&str> = apps[0]["target_boards"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(boards, vec!["nrf52840dk/nrf52840"]);
+        let libs: Vec<&str> = apps[0]["libraries"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(libs, vec!["crash_log"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_without_manifest() {
+        // Apps without manifest.yml should still work (backwards compatible)
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let app = apps_dir.join("old_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(old_app)\n").unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_apps(Parameters(ListAppsArgs { workspace_path: None }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let apps = parsed["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0]["name"].as_str().unwrap(), "old_app");
+        // Manifest fields should not be present (skip_serializing_if)
+        assert!(apps[0].get("description").is_none());
+        assert!(apps[0].get("target_boards").is_none());
+        assert!(apps[0].get("libraries").is_none());
+    }
 }
 
 #[tool_handler]
@@ -1914,8 +2394,8 @@ impl ServerHandler for ZephyrBuildToolHandler {
             server_info: Implementation::from_build_env(),
             instructions: Some(
                 "Zephyr Build MCP Server - Build and test Zephyr RTOS applications. \
-                 9 tools available: list_apps, list_boards, build, build_all, clean, build_status, \
-                 run_tests, test_status, test_results.".to_string()
+                 11 tools available: list_apps, list_boards, list_templates, build, build_all, \
+                 clean, create_app, build_status, run_tests, test_status, test_results.".to_string()
             ),
         }
     }
@@ -1925,7 +2405,7 @@ impl ServerHandler for ZephyrBuildToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Zephyr Build MCP server initialized with 9 tools");
+        info!("Zephyr Build MCP server initialized with 11 tools");
         Ok(self.get_info())
     }
 }
