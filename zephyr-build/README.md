@@ -2,7 +2,7 @@
 
 MCP server for building Zephyr RTOS applications. Wraps the `west` build system to enable AI-assisted firmware building.
 
-## Tools (5)
+## Tools (8)
 
 | Tool | Description |
 |------|-------------|
@@ -11,6 +11,9 @@ MCP server for building Zephyr RTOS applications. Wraps the `west` build system 
 | `build` | Build an application for a target board |
 | `clean` | Remove build artifacts |
 | `build_status` | Check status of background builds |
+| `run_tests` | Run Zephyr tests using twister with parsed results |
+| `test_status` | Check status of a background test run |
+| `test_results` | Parse results from a completed test run |
 
 ## Quick Start
 
@@ -57,6 +60,29 @@ The server finds the Zephyr workspace via (in order):
 
 // Clean build artifacts
 {"method": "tools/call", "params": {"name": "clean", "arguments": {"app": "ble_wifi_bridge"}}}
+
+// Run tests
+{"method": "tools/call", "params": {"name": "run_tests", "arguments": {
+  "board": "qemu_cortex_m3"
+}}}
+
+// Run tests for a specific library
+{"method": "tools/call", "params": {"name": "run_tests", "arguments": {
+  "path": "lib/crash_log",
+  "board": "qemu_cortex_m3"
+}}}
+
+// Run tests in background
+{"method": "tools/call", "params": {"name": "run_tests", "arguments": {
+  "board": "qemu_cortex_m3",
+  "background": true
+}}}
+
+// Check test status
+{"method": "tools/call", "params": {"name": "test_status", "arguments": {"test_id": "abc123"}}}
+
+// Get parsed test results
+{"method": "tools/call", "params": {"name": "test_results", "arguments": {"test_id": "abc123"}}}
 ```
 
 ## Requirements

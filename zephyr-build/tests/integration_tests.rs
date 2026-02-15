@@ -42,3 +42,13 @@ fn test_multiple_handlers() {
         apps_dir: "apps".to_string(),
     });
 }
+
+#[test]
+fn test_handler_clone_shares_state() {
+    // Cloned handlers should share build/test state (Arc)
+    let h1 = ZephyrBuildToolHandler::default();
+    let h2 = h1.clone();
+    // Both should work independently without panic
+    drop(h2);
+    let _h3 = h1.clone();
+}

@@ -183,3 +183,129 @@ pub struct BuildStatusResult {
     /// Error message if failed
     pub error: Option<String>,
 }
+
+// ============================================================================
+// run_tests
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RunTestsArgs {
+    /// Test path filter relative to apps parent dir (e.g., "lib/crash_log")
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Platform to test on (e.g., "qemu_cortex_m3")
+    pub board: String,
+    /// Test name filter (-k pattern)
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Additional twister arguments
+    #[serde(default)]
+    pub extra_args: Option<String>,
+    /// Run tests in background
+    #[serde(default)]
+    pub background: bool,
+    /// Override workspace path
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RunTestsResult {
+    pub success: bool,
+    /// Test run ID for background runs
+    pub test_id: Option<String>,
+    /// Parsed summary (foreground only)
+    pub summary: Option<TestSummary>,
+    /// Raw twister output
+    pub output: String,
+    /// Duration in milliseconds
+    pub duration_ms: u64,
+}
+
+// ============================================================================
+// test_status
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TestStatusArgs {
+    /// Test run ID from background run
+    pub test_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestStatusResult {
+    /// Status: "running", "complete", "failed"
+    pub status: String,
+    /// Progress info if running
+    pub progress: Option<String>,
+    /// Parsed summary if complete
+    pub summary: Option<TestSummary>,
+    /// Raw output if complete
+    pub output: Option<String>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+// ============================================================================
+// test_results
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TestResultsArgs {
+    /// Test run ID from background run
+    #[serde(default)]
+    pub test_id: Option<String>,
+    /// Path to existing twister output directory
+    #[serde(default)]
+    pub results_dir: Option<String>,
+    /// Override workspace path
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TestResultsResult {
+    pub summary: TestSummary,
+    pub test_suites: Vec<TestSuiteResult>,
+    pub failures: Vec<TestFailure>,
+}
+
+// ============================================================================
+// shared test types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestSummary {
+    pub total: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub skipped: u32,
+    pub errors: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestSuiteResult {
+    pub name: String,
+    pub platform: String,
+    pub status: String,
+    pub duration_ms: u64,
+    pub used_ram: Option<u64>,
+    pub used_rom: Option<u64>,
+    pub test_cases: Vec<TestCaseResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestCaseResult {
+    pub name: String,
+    pub status: String,
+    pub duration_ms: u64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TestFailure {
+    pub suite_name: String,
+    pub test_name: Option<String>,
+    pub platform: String,
+    pub log: String,
+}

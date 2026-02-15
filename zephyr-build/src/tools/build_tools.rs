@@ -1,6 +1,7 @@
-//! Complete RMCP 0.3.2 implementation for Zephyr build MCP tools
+//! Complete RMCP 0.3.2 implementation for Zephyr build and test MCP tools
 //!
-//! This implementation provides 6 build tools using west CLI subprocess calls
+//! This implementation provides 9 tools: 6 build tools using west CLI subprocess calls
+//! and 3 test tools using twister subprocess calls
 
 use rmcp::{
     tool, tool_router, tool_handler, ServerHandler,
@@ -21,6 +22,11 @@ use tokio::process::Command;
 
 use super::types::*;
 use crate::config::Config;
+
+/// Get home directory path
+fn dirs_path() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
 
 /// Common boards for quick listing (without running west boards)
 const COMMON_BOARDS: &[(&str, &str, &str)] = &[
@@ -56,13 +62,31 @@ pub enum BuildStatus {
     Failed,
 }
 
-/// Zephyr build tool handler with all 6 tools
+/// Test run state for background test runs
+#[derive(Debug, Clone)]
+pub struct TestState {
+    pub status: TestRunStatus,
+    pub output: String,
+    pub started_at: Instant,
+    pub board: String,
+    pub output_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestRunStatus {
+    Running,
+    Complete,
+    Failed,
+}
+
+/// Zephyr build tool handler with all 9 tools
 #[derive(Clone)]
 pub struct ZephyrBuildToolHandler {
     #[allow(dead_code)]
     tool_router: ToolRouter<ZephyrBuildToolHandler>,
     config: Config,
     builds: Arc<RwLock<HashMap<String, BuildState>>>,
+    tests: Arc<RwLock<HashMap<String, TestState>>>,
 }
 
 impl ZephyrBuildToolHandler {
@@ -71,6 +95,7 @@ impl ZephyrBuildToolHandler {
             tool_router: Self::tool_router(),
             config,
             builds: Arc::new(RwLock::new(HashMap::new())),
+            tests: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -129,6 +154,63 @@ impl ZephyrBuildToolHandler {
         workspace.join(&self.config.apps_dir)
     }
 
+    /// Detect Zephyr SDK install path from cmake package registry or common locations
+    fn find_zephyr_sdk() -> Option<PathBuf> {
+        // 1. Check env var (already set by user)
+        if let Ok(path) = std::env::var("ZEPHYR_SDK_INSTALL_DIR") {
+            let p = PathBuf::from(&path);
+            if p.join("sdk_version").exists() {
+                return Some(p);
+            }
+        }
+
+        // 2. Check cmake package registry (~/.cmake/packages/Zephyr-sdk/)
+        if let Some(home) = dirs_path() {
+            let registry = home.join(".cmake/packages/Zephyr-sdk");
+            if registry.exists() {
+                // Read all registration files, pick the newest SDK
+                let mut sdk_paths: Vec<PathBuf> = Vec::new();
+                if let Ok(entries) = std::fs::read_dir(&registry) {
+                    for entry in entries.flatten() {
+                        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                            // Content is like "/path/to/zephyr-sdk-0.17.4/cmake"
+                            let cmake_dir = PathBuf::from(content.trim());
+                            if let Some(sdk_dir) = cmake_dir.parent() {
+                                if sdk_dir.join("sdk_version").exists() {
+                                    sdk_paths.push(sdk_dir.to_path_buf());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Sort by path name descending to prefer newer versions
+                sdk_paths.sort();
+                if let Some(path) = sdk_paths.last() {
+                    return Some(path.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Create a twister Command with Zephyr SDK environment set
+    fn twister_command(workspace: &Path, cmd_args: &[String]) -> Command {
+        let mut cmd = Command::new("python3");
+        cmd.args(cmd_args).current_dir(workspace);
+
+        // Set SDK env vars if not already in environment
+        if std::env::var("ZEPHYR_TOOLCHAIN_VARIANT").is_err() {
+            if let Some(sdk_path) = Self::find_zephyr_sdk() {
+                cmd.env("ZEPHYR_TOOLCHAIN_VARIANT", "zephyr");
+                cmd.env("ZEPHYR_SDK_INSTALL_DIR", &sdk_path);
+                cmd.env("ZEPHYR_BASE", workspace.join("zephyr"));
+            }
+        }
+
+        cmd
+    }
+
     /// Find app path (handles both name and full path)
     fn find_app_path(&self, workspace: &Path, app: &str) -> Result<PathBuf, McpError> {
         let apps_dir = self.get_apps_dir(workspace);
@@ -162,7 +244,7 @@ impl Default for ZephyrBuildToolHandler {
 #[tool_router]
 impl ZephyrBuildToolHandler {
     // =============================================================================
-    // Build Tools (6 tools)
+    // Build Tools
     // =============================================================================
 
     #[tool(description = "List available Zephyr applications in the workspace")]
@@ -669,6 +751,364 @@ impl ZephyrBuildToolHandler {
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    // =============================================================================
+    // Test Tools (3 tools)
+    // =============================================================================
+
+    #[tool(description = "Run Zephyr tests using twister. Returns parsed results with pass/fail counts and failure details.")]
+    async fn run_tests(&self, Parameters(args): Parameters<RunTestsArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Running tests for board '{}'", args.board);
+
+        let workspace = self.find_workspace(args.workspace_path.as_deref())?;
+        let twister_script = workspace.join("zephyr/scripts/twister");
+
+        if !twister_script.exists() {
+            return Err(McpError::internal_error(
+                format!("Twister script not found at: {}", twister_script.display()),
+                None,
+            ));
+        }
+
+        // Resolve test path: default to lib/ directory under apps parent
+        let apps_dir = self.get_apps_dir(&workspace);
+        let apps_parent = apps_dir.parent().unwrap_or(&apps_dir);
+        let test_path = match &args.path {
+            Some(p) => apps_parent.join(p),
+            None => apps_parent.join("lib"),
+        };
+
+        if !test_path.exists() {
+            return Err(McpError::invalid_params(
+                format!("Test path does not exist: {}", test_path.display()),
+                None,
+            ));
+        }
+
+        let test_id = uuid::Uuid::new_v4().to_string();
+        let output_dir = workspace.join(".cache/twister").join(&test_id);
+
+        // Build twister command args
+        let mut cmd_args = vec![
+            twister_script.to_string_lossy().to_string(),
+            "-T".to_string(),
+            test_path.to_string_lossy().to_string(),
+            "-p".to_string(),
+            args.board.clone(),
+            "-O".to_string(),
+            output_dir.to_string_lossy().to_string(),
+            "--inline-logs".to_string(),
+        ];
+
+        if let Some(filter) = &args.filter {
+            cmd_args.push("-k".to_string());
+            cmd_args.push(filter.clone());
+        }
+
+        if let Some(extra) = &args.extra_args {
+            cmd_args.extend(extra.split_whitespace().map(String::from));
+        }
+
+        if args.background {
+            let test_state = TestState {
+                status: TestRunStatus::Running,
+                output: String::new(),
+                started_at: Instant::now(),
+                board: args.board.clone(),
+                output_dir: output_dir.clone(),
+            };
+
+            {
+                let mut tests = self.tests.write().await;
+                tests.insert(test_id.clone(), test_state);
+            }
+
+            let tests = self.tests.clone();
+            let test_id_clone = test_id.clone();
+
+            tokio::spawn(async move {
+                let start = Instant::now();
+                let output = ZephyrBuildToolHandler::twister_command(&workspace, &cmd_args)
+                    .output()
+                    .await;
+
+                let mut tests = tests.write().await;
+                if let Some(state) = tests.get_mut(&test_id_clone) {
+                    match output {
+                        Ok(out) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            state.output = format!("{}\n{}", stdout, stderr);
+                            // twister returns non-zero on test failures, which is not an execution error
+                            state.status = TestRunStatus::Complete;
+                        }
+                        Err(e) => {
+                            state.status = TestRunStatus::Failed;
+                            state.output = format!("Failed to execute twister: {}", e);
+                        }
+                    }
+                }
+                info!("Background test run {} completed in {:?}", test_id_clone, start.elapsed());
+            });
+
+            let result = RunTestsResult {
+                success: true,
+                test_id: Some(test_id.clone()),
+                summary: None,
+                output: "Test run started in background".to_string(),
+                duration_ms: 0,
+            };
+
+            let json = serde_json::to_string_pretty(&result).map_err(|e| {
+                McpError::internal_error(format!("Serialization error: {}", e), None)
+            })?;
+
+            info!("Started background test run: {}", test_id);
+            return Ok(CallToolResult::success(vec![Content::text(json)]));
+        }
+
+        // Synchronous test run
+        let start = Instant::now();
+        info!("Running: python3 {}", cmd_args.join(" "));
+
+        let output = Self::twister_command(&workspace, &cmd_args)
+            .output()
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Failed to execute twister: {}", e), None)
+            })?;
+
+        let duration = start.elapsed();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined_output = format!("{}\n{}", stdout, stderr);
+
+        // Parse results from twister.json
+        let summary = parse_twister_json(&output_dir)
+            .map(|r| r.summary)
+            .ok();
+
+        let result = RunTestsResult {
+            success: output.status.success(),
+            test_id: Some(test_id),
+            summary,
+            output: combined_output,
+            duration_ms: duration.as_millis() as u64,
+        };
+
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        if output.status.success() {
+            info!("Tests completed successfully in {:?}", duration);
+        } else {
+            info!("Tests completed with failures in {:?}", duration);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Check status of a background test run")]
+    async fn test_status(&self, Parameters(args): Parameters<TestStatusArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Checking test status for '{}'", args.test_id);
+
+        let tests = self.tests.read().await;
+
+        let result = match tests.get(&args.test_id) {
+            Some(state) => {
+                let summary = if state.status == TestRunStatus::Complete {
+                    parse_twister_json(&state.output_dir).map(|r| r.summary).ok()
+                } else {
+                    None
+                };
+
+                TestStatusResult {
+                    status: match state.status {
+                        TestRunStatus::Running => "running".to_string(),
+                        TestRunStatus::Complete => "complete".to_string(),
+                        TestRunStatus::Failed => "failed".to_string(),
+                    },
+                    progress: if state.status == TestRunStatus::Running {
+                        Some(format!("Testing on {} ({:?} elapsed)",
+                                    state.board, state.started_at.elapsed()))
+                    } else {
+                        None
+                    },
+                    summary,
+                    output: if state.status != TestRunStatus::Running {
+                        Some(state.output.clone())
+                    } else {
+                        None
+                    },
+                    error: if state.status == TestRunStatus::Failed {
+                        Some(state.output.clone())
+                    } else {
+                        None
+                    },
+                }
+            }
+            None => {
+                return Err(McpError::invalid_params(
+                    format!("Test ID not found: {}", args.test_id),
+                    None,
+                ));
+            }
+        };
+
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    #[tool(description = "Parse results from a completed test run. Returns structured test suites, failures, and summary.")]
+    async fn test_results(&self, Parameters(args): Parameters<TestResultsArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Parsing test results");
+
+        let output_dir = if let Some(test_id) = &args.test_id {
+            // Look up from test state first
+            let tests = self.tests.read().await;
+            if let Some(state) = tests.get(test_id) {
+                if state.status == TestRunStatus::Running {
+                    return Err(McpError::invalid_params(
+                        "Test run is still in progress".to_string(),
+                        None,
+                    ));
+                }
+                state.output_dir.clone()
+            } else {
+                // Fall back to conventional path
+                let workspace = self.find_workspace(args.workspace_path.as_deref())?;
+                workspace.join(".cache/twister").join(test_id)
+            }
+        } else if let Some(dir) = &args.results_dir {
+            PathBuf::from(dir)
+        } else {
+            return Err(McpError::invalid_params(
+                "Either test_id or results_dir is required".to_string(),
+                None,
+            ));
+        };
+
+        let result = parse_twister_json(&output_dir).map_err(|e| {
+            McpError::internal_error(
+                format!("Failed to parse test results from {}: {}", output_dir.display(), e),
+                None,
+            )
+        })?;
+
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+}
+
+/// Parse twister.json output into structured results
+fn parse_twister_json(output_dir: &Path) -> Result<TestResultsResult, String> {
+    let json_path = output_dir.join("twister.json");
+    let content = std::fs::read_to_string(&json_path)
+        .map_err(|e| format!("Cannot read {}: {}", json_path.display(), e))?;
+
+    let data: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Invalid JSON in {}: {}", json_path.display(), e))?;
+
+    let testsuites = data["testsuites"]
+        .as_array()
+        .ok_or_else(|| "Missing 'testsuites' array in twister.json".to_string())?;
+
+    let mut summary = TestSummary {
+        total: 0,
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        errors: 0,
+    };
+
+    let mut suites = Vec::new();
+    let mut failures = Vec::new();
+
+    for suite in testsuites {
+        let name = suite["name"].as_str().unwrap_or("unknown").to_string();
+        let platform = suite["platform"].as_str().unwrap_or("unknown").to_string();
+        let status = suite["status"].as_str().unwrap_or("unknown").to_string();
+
+        // Parse execution_time (twister outputs seconds as string like "2.50")
+        let duration_ms = suite["execution_time"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|s| (s * 1000.0) as u64)
+            .unwrap_or(0);
+
+        let used_ram = suite["used_ram"].as_u64();
+        let used_rom = suite["used_rom"].as_u64();
+
+        // Parse test cases
+        let mut test_cases = Vec::new();
+        if let Some(cases) = suite["testcases"].as_array() {
+            for case in cases {
+                let case_name = case["identifier"].as_str().unwrap_or("unknown").to_string();
+                let case_status = case["status"].as_str().unwrap_or("unknown").to_string();
+                let case_duration_ms = case["execution_time"]
+                    .as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|s| (s * 1000.0) as u64)
+                    .unwrap_or(0);
+                let reason = case["reason"].as_str().map(|s| s.to_string());
+
+                test_cases.push(TestCaseResult {
+                    name: case_name,
+                    status: case_status,
+                    duration_ms: case_duration_ms,
+                    reason,
+                });
+            }
+        }
+
+        // Count by status
+        summary.total += 1;
+        match status.as_str() {
+            "passed" => summary.passed += 1,
+            "failed" => summary.failed += 1,
+            "error" => summary.errors += 1,
+            "skipped" | "filtered" => summary.skipped += 1,
+            _ => {}
+        }
+
+        // Collect failures
+        if status == "failed" || status == "error" {
+            let log = suite["log"].as_str().unwrap_or("").to_string();
+            // Find first failing test case name if any
+            let test_name = test_cases.iter()
+                .find(|c| c.status == "failed" || c.status == "error")
+                .map(|c| c.name.clone());
+            failures.push(TestFailure {
+                suite_name: name.clone(),
+                test_name,
+                platform: platform.clone(),
+                log,
+            });
+        }
+
+        suites.push(TestSuiteResult {
+            name,
+            platform,
+            status,
+            duration_ms,
+            used_ram,
+            used_rom,
+            test_cases,
+        });
+    }
+
+    Ok(TestResultsResult {
+        summary,
+        test_suites: suites,
+        failures,
+    })
 }
 
 #[cfg(test)]
@@ -896,6 +1336,573 @@ mod tests {
         let parsed = extract_json(&result);
         assert!(parsed["success"].as_bool().unwrap());
     }
+
+    // =========================================================================
+    // Test tool tests
+    // =========================================================================
+
+    /// Create a twister.json file with the given content
+    fn write_twister_json(dir: &Path, content: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("twister.json"), content).unwrap();
+    }
+
+    /// Minimal twister.json with all passing tests
+    const TWISTER_JSON_ALL_PASS: &str = r#"{
+        "environment": {},
+        "testsuites": [
+            {
+                "name": "lib.crash_log.unit_tests",
+                "arch": "arm",
+                "platform": "qemu_cortex_m3",
+                "path": "lib/crash_log",
+                "status": "passed",
+                "runnable": true,
+                "execution_time": "2.50",
+                "build_time": "5.00",
+                "used_ram": 8192,
+                "used_rom": 32768,
+                "testcases": [
+                    {
+                        "identifier": "test_crash_log_init",
+                        "status": "passed",
+                        "execution_time": "1.20"
+                    },
+                    {
+                        "identifier": "test_crash_log_write",
+                        "status": "passed",
+                        "execution_time": "1.30"
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    /// Twister.json with mixed results (pass, fail, skip)
+    const TWISTER_JSON_MIXED: &str = r#"{
+        "environment": {},
+        "testsuites": [
+            {
+                "name": "lib.crash_log.unit_tests",
+                "arch": "arm",
+                "platform": "qemu_cortex_m3",
+                "path": "lib/crash_log",
+                "status": "passed",
+                "runnable": true,
+                "execution_time": "2.50",
+                "build_time": "5.00",
+                "testcases": [
+                    {
+                        "identifier": "test_crash_log_init",
+                        "status": "passed",
+                        "execution_time": "2.50"
+                    }
+                ]
+            },
+            {
+                "name": "lib.device_shell.tests",
+                "arch": "arm",
+                "platform": "qemu_cortex_m3",
+                "path": "lib/device_shell",
+                "status": "failed",
+                "runnable": true,
+                "execution_time": "3.00",
+                "build_time": "4.00",
+                "log": "FAIL: assertion failed at test_shell.c:42\nExpected 1, got 0",
+                "testcases": [
+                    {
+                        "identifier": "test_shell_register",
+                        "status": "passed",
+                        "execution_time": "1.00"
+                    },
+                    {
+                        "identifier": "test_shell_execute",
+                        "status": "failed",
+                        "execution_time": "2.00",
+                        "reason": "assertion failed"
+                    }
+                ]
+            },
+            {
+                "name": "lib.ble_utils.tests",
+                "arch": "arm",
+                "platform": "qemu_cortex_m3",
+                "path": "lib/ble_utils",
+                "status": "skipped",
+                "runnable": false,
+                "execution_time": "0.00",
+                "build_time": "0.00",
+                "testcases": []
+            },
+            {
+                "name": "lib.sensor.tests",
+                "arch": "arm",
+                "platform": "qemu_cortex_m3",
+                "path": "lib/sensor",
+                "status": "error",
+                "runnable": true,
+                "execution_time": "0.00",
+                "build_time": "1.50",
+                "log": "CMake Error: could not find sensor.h",
+                "testcases": []
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn test_parse_twister_json_all_pass() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), TWISTER_JSON_ALL_PASS);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+
+        assert_eq!(result.summary.total, 1);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 0);
+        assert_eq!(result.summary.skipped, 0);
+        assert_eq!(result.summary.errors, 0);
+        assert!(result.failures.is_empty());
+
+        assert_eq!(result.test_suites.len(), 1);
+        let suite = &result.test_suites[0];
+        assert_eq!(suite.name, "lib.crash_log.unit_tests");
+        assert_eq!(suite.platform, "qemu_cortex_m3");
+        assert_eq!(suite.status, "passed");
+        assert_eq!(suite.duration_ms, 2500);
+        assert_eq!(suite.used_ram, Some(8192));
+        assert_eq!(suite.used_rom, Some(32768));
+
+        assert_eq!(suite.test_cases.len(), 2);
+        assert_eq!(suite.test_cases[0].name, "test_crash_log_init");
+        assert_eq!(suite.test_cases[0].status, "passed");
+        assert_eq!(suite.test_cases[0].duration_ms, 1200);
+        assert_eq!(suite.test_cases[1].name, "test_crash_log_write");
+        assert_eq!(suite.test_cases[1].duration_ms, 1300);
+    }
+
+    #[test]
+    fn test_parse_twister_json_mixed_results() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), TWISTER_JSON_MIXED);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+
+        assert_eq!(result.summary.total, 4);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.summary.skipped, 1);
+        assert_eq!(result.summary.errors, 1);
+
+        // Should have 2 failures (failed + error)
+        assert_eq!(result.failures.len(), 2);
+
+        let fail = &result.failures[0];
+        assert_eq!(fail.suite_name, "lib.device_shell.tests");
+        assert_eq!(fail.test_name.as_deref(), Some("test_shell_execute"));
+        assert!(fail.log.contains("assertion failed"));
+
+        let error = &result.failures[1];
+        assert_eq!(error.suite_name, "lib.sensor.tests");
+        assert_eq!(error.test_name, None); // no testcases in error suite
+        assert!(error.log.contains("CMake Error"));
+    }
+
+    #[test]
+    fn test_parse_twister_json_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let result = parse_twister_json(tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Cannot read"));
+    }
+
+    #[test]
+    fn test_parse_twister_json_invalid_json() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), "not valid json {{{");
+        let result = parse_twister_json(tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid JSON"));
+    }
+
+    #[test]
+    fn test_parse_twister_json_missing_testsuites() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), r#"{"environment": {}}"#);
+        let result = parse_twister_json(tmp.path());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Missing 'testsuites'"));
+    }
+
+    #[test]
+    fn test_parse_twister_json_empty_testsuites() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), r#"{"testsuites": []}"#);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+        assert_eq!(result.summary.total, 0);
+        assert!(result.test_suites.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_parse_twister_json_filtered_status() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), r#"{
+            "testsuites": [{
+                "name": "filtered_test",
+                "platform": "qemu_cortex_m3",
+                "status": "filtered",
+                "execution_time": "0.00",
+                "testcases": []
+            }]
+        }"#);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+        assert_eq!(result.summary.total, 1);
+        assert_eq!(result.summary.skipped, 1);
+        assert!(result.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_test_status_unknown_id() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .test_status(Parameters(TestStatusArgs {
+                test_id: "nonexistent-test-id".to_string(),
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_test_results_no_args() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .test_results(Parameters(TestResultsArgs {
+                test_id: None,
+                results_dir: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_test_results_from_dir() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), TWISTER_JSON_ALL_PASS);
+
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .test_results(Parameters(TestResultsArgs {
+                test_id: None,
+                results_dir: Some(tmp.path().to_string_lossy().to_string()),
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert_eq!(parsed["summary"]["total"].as_u64().unwrap(), 1);
+        assert_eq!(parsed["summary"]["passed"].as_u64().unwrap(), 1);
+        assert_eq!(parsed["test_suites"].as_array().unwrap().len(), 1);
+        assert!(parsed["failures"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_test_results_from_dir_with_failures() {
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), TWISTER_JSON_MIXED);
+
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .test_results(Parameters(TestResultsArgs {
+                test_id: None,
+                results_dir: Some(tmp.path().to_string_lossy().to_string()),
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert_eq!(parsed["summary"]["total"].as_u64().unwrap(), 4);
+        assert_eq!(parsed["summary"]["failed"].as_u64().unwrap(), 1);
+        assert_eq!(parsed["summary"]["errors"].as_u64().unwrap(), 1);
+        assert_eq!(parsed["failures"].as_array().unwrap().len(), 2);
+
+        // Check failure details are included
+        let failure = &parsed["failures"][0];
+        assert_eq!(failure["suite_name"].as_str().unwrap(), "lib.device_shell.tests");
+        assert!(failure["log"].as_str().unwrap().contains("assertion failed"));
+    }
+
+    #[tokio::test]
+    async fn test_test_results_missing_dir() {
+        let handler = ZephyrBuildToolHandler::default();
+        let result = handler
+            .test_results(Parameters(TestResultsArgs {
+                test_id: None,
+                results_dir: Some("/tmp/nonexistent_twister_output_xyz".to_string()),
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_test_status_with_stored_state() {
+        let handler = ZephyrBuildToolHandler::default();
+        let test_id = "test-state-check";
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), TWISTER_JSON_ALL_PASS);
+
+        // Insert a completed test state
+        {
+            let mut tests = handler.tests.write().await;
+            tests.insert(test_id.to_string(), TestState {
+                status: TestRunStatus::Complete,
+                output: "test output here".to_string(),
+                started_at: Instant::now(),
+                board: "qemu_cortex_m3".to_string(),
+                output_dir: tmp.path().to_path_buf(),
+            });
+        }
+
+        let result = handler
+            .test_status(Parameters(TestStatusArgs {
+                test_id: test_id.to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert_eq!(parsed["status"].as_str().unwrap(), "complete");
+        assert!(parsed["output"].as_str().unwrap().contains("test output"));
+        assert!(parsed["summary"]["passed"].as_u64().unwrap() == 1);
+        assert!(parsed["error"].is_null());
+        assert!(parsed["progress"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_test_status_running_state() {
+        let handler = ZephyrBuildToolHandler::default();
+        let test_id = "test-running";
+
+        {
+            let mut tests = handler.tests.write().await;
+            tests.insert(test_id.to_string(), TestState {
+                status: TestRunStatus::Running,
+                output: String::new(),
+                started_at: Instant::now(),
+                board: "qemu_cortex_m3".to_string(),
+                output_dir: PathBuf::from("/tmp/fake"),
+            });
+        }
+
+        let result = handler
+            .test_status(Parameters(TestStatusArgs {
+                test_id: test_id.to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert_eq!(parsed["status"].as_str().unwrap(), "running");
+        assert!(parsed["progress"].as_str().unwrap().contains("qemu_cortex_m3"));
+        assert!(parsed["output"].is_null());
+        assert!(parsed["summary"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_test_results_from_stored_running_state() {
+        let handler = ZephyrBuildToolHandler::default();
+        let test_id = "test-still-running";
+
+        {
+            let mut tests = handler.tests.write().await;
+            tests.insert(test_id.to_string(), TestState {
+                status: TestRunStatus::Running,
+                output: String::new(),
+                started_at: Instant::now(),
+                board: "qemu_cortex_m3".to_string(),
+                output_dir: PathBuf::from("/tmp/fake"),
+            });
+        }
+
+        let result = handler
+            .test_results(Parameters(TestResultsArgs {
+                test_id: Some(test_id.to_string()),
+                results_dir: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err()); // Should reject in-progress runs
+    }
+
+    #[test]
+    fn test_parse_twister_json_sparse_fields() {
+        // Real twister output may omit optional fields like used_ram, execution_time, testcases
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), r#"{
+            "testsuites": [{
+                "name": "minimal.test",
+                "status": "passed"
+            }]
+        }"#);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+        assert_eq!(result.summary.total, 1);
+        assert_eq!(result.summary.passed, 1);
+
+        let suite = &result.test_suites[0];
+        assert_eq!(suite.name, "minimal.test");
+        assert_eq!(suite.platform, "unknown");
+        assert_eq!(suite.duration_ms, 0);
+        assert_eq!(suite.used_ram, None);
+        assert_eq!(suite.used_rom, None);
+        assert!(suite.test_cases.is_empty());
+    }
+
+    #[test]
+    fn test_parse_twister_json_failure_reason_propagated() {
+        // Verify that test case failure reasons are accessible in the parsed output
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), r#"{
+            "testsuites": [{
+                "name": "reason.test",
+                "platform": "qemu_cortex_m3",
+                "status": "failed",
+                "execution_time": "1.00",
+                "log": "full log output",
+                "testcases": [{
+                    "identifier": "test_with_reason",
+                    "status": "failed",
+                    "execution_time": "0.50",
+                    "reason": "Expected 42, got 0"
+                }]
+            }]
+        }"#);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+
+        // Failure should capture the reason from test case
+        let case = &result.test_suites[0].test_cases[0];
+        assert_eq!(case.reason.as_deref(), Some("Expected 42, got 0"));
+
+        // And the suite-level failure should reference the failing test
+        let failure = &result.failures[0];
+        assert_eq!(failure.test_name.as_deref(), Some("test_with_reason"));
+        assert_eq!(failure.log, "full log output");
+    }
+
+    #[test]
+    fn test_parse_twister_json_multiple_platforms() {
+        // Same test suite on different platforms — both should appear
+        let tmp = TempDir::new().unwrap();
+        write_twister_json(tmp.path(), r#"{
+            "testsuites": [
+                {"name": "my.test", "platform": "qemu_cortex_m3", "status": "passed", "execution_time": "1.00", "testcases": []},
+                {"name": "my.test", "platform": "native_sim", "status": "failed", "execution_time": "2.00", "log": "segfault", "testcases": []}
+            ]
+        }"#);
+
+        let result = parse_twister_json(tmp.path()).unwrap();
+        assert_eq!(result.summary.total, 2);
+        assert_eq!(result.summary.passed, 1);
+        assert_eq!(result.summary.failed, 1);
+        assert_eq!(result.test_suites.len(), 2);
+
+        // Failure should be on native_sim platform
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].platform, "native_sim");
+    }
+
+    #[tokio::test]
+    async fn test_test_status_failed_state_includes_output() {
+        let handler = ZephyrBuildToolHandler::default();
+        let test_id = "test-exec-failed";
+
+        {
+            let mut tests = handler.tests.write().await;
+            tests.insert(test_id.to_string(), TestState {
+                status: TestRunStatus::Failed,
+                output: "Failed to execute twister: command not found".to_string(),
+                started_at: Instant::now(),
+                board: "qemu_cortex_m3".to_string(),
+                output_dir: PathBuf::from("/tmp/fake"),
+            });
+        }
+
+        let result = handler
+            .test_status(Parameters(TestStatusArgs {
+                test_id: test_id.to_string(),
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert_eq!(parsed["status"].as_str().unwrap(), "failed");
+        // Error field should contain the failure message
+        assert!(parsed["error"].as_str().unwrap().contains("command not found"));
+        // Output should also be available
+        assert!(parsed["output"].as_str().unwrap().contains("command not found"));
+    }
+
+    #[tokio::test]
+    async fn test_run_tests_missing_twister_script() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let lib_dir = tmp.path().join("zephyr-apps/lib");
+        fs::create_dir_all(&apps_dir).unwrap();
+        fs::create_dir_all(&lib_dir).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .run_tests(Parameters(RunTestsArgs {
+                path: None,
+                board: "qemu_cortex_m3".to_string(),
+                filter: None,
+                extra_args: None,
+                background: false,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+        // Should fail because zephyr/scripts/twister doesn't exist
+    }
+
+    #[tokio::test]
+    async fn test_run_tests_missing_test_path() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+        // Create the twister script so we get past that check
+        let twister_dir = tmp.path().join("zephyr/scripts");
+        fs::create_dir_all(&twister_dir).unwrap();
+        fs::write(twister_dir.join("twister"), "#!/bin/bash\n").unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // Default path (lib/) doesn't exist
+        let result = handler
+            .run_tests(Parameters(RunTestsArgs {
+                path: None,
+                board: "qemu_cortex_m3".to_string(),
+                filter: None,
+                extra_args: None,
+                background: false,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
 }
 
 #[tool_handler]
@@ -906,8 +1913,9 @@ impl ServerHandler for ZephyrBuildToolHandler {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "Zephyr Build MCP Server - Build Zephyr RTOS applications. \
-                 6 tools available: list_apps, list_boards, build, build_all, clean, build_status.".to_string()
+                "Zephyr Build MCP Server - Build and test Zephyr RTOS applications. \
+                 9 tools available: list_apps, list_boards, build, build_all, clean, build_status, \
+                 run_tests, test_status, test_results.".to_string()
             ),
         }
     }
@@ -917,7 +1925,7 @@ impl ServerHandler for ZephyrBuildToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Zephyr Build MCP server initialized with 6 tools");
+        info!("Zephyr Build MCP server initialized with 9 tools");
         Ok(self.get_info())
     }
 }
