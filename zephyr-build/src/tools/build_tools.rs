@@ -309,12 +309,17 @@ impl ZephyrBuildToolHandler {
         let workspace = self.find_workspace(args.workspace_path.as_deref())?;
         let app_path = self.find_app_path(&workspace, &args.app)?;
 
+        // Per-app build directory so apps don't overwrite each other
+        let build_dir = app_path.join("build");
+
         // Build the command
         let mut cmd_args = vec![
             "build".to_string(),
             "-b".to_string(),
             args.board.clone(),
             app_path.to_string_lossy().to_string(),
+            "-d".to_string(),
+            build_dir.to_string_lossy().to_string(),
         ];
 
         if args.pristine {
@@ -347,7 +352,7 @@ impl ZephyrBuildToolHandler {
             let builds = self.builds.clone();
             let build_id_clone = build_id.clone();
             let workspace_clone = workspace.clone();
-            let app_clone = args.app.clone();
+            let app_path_clone = app_path.clone();
 
             tokio::spawn(async move {
                 let start = Instant::now();
@@ -368,8 +373,7 @@ impl ZephyrBuildToolHandler {
                             if out.status.success() {
                                 state.status = BuildStatus::Complete;
                                 // Look for artifact
-                                let artifact = workspace_clone
-                                    .join(&app_clone)
+                                let artifact = app_path_clone
                                     .join("build/zephyr/zephyr.elf");
                                 if artifact.exists() {
                                     state.artifact_path = Some(artifact.to_string_lossy().to_string());

@@ -1,32 +1,31 @@
 # Claude MCP Servers
 
-This repository contains Model Context Protocol (MCP) servers for use with Claude.
+MCP servers for embedded development with Claude. Each server has its own `CLAUDE.md` with detailed tool docs.
 
 ## Available MCPs
 
-### embedded-probe
+| Server | Language | Purpose |
+|--------|----------|---------|
+| `embedded-probe/` | Rust | Debug probes, flash programming, RTT, coredump analysis |
+| `zephyr-build/` | Rust | Zephyr RTOS build system (west wrapper) |
+| `esp-idf-build/` | Rust | ESP-IDF build, flash, and monitor |
+| `saleae-logic/` | Python | Logic analyzer capture and protocol decoding |
 
-Embedded debugging and flash programming via probe-rs. 27 tools including:
-- Debug probe connection (J-Link, ST-Link, CMSIS-DAP)
-- Memory read/write
-- Flash programming (erase, program, verify)
-- RTT communication
-- Boot validation
-- Vendor tools (esptool for ESP32, nrfjprog for Nordic)
+## Building
 
-Build: `cd embedded-probe && cargo build --release`
+```bash
+# Rust servers
+cd embedded-probe && cargo build --release
+cd zephyr-build && cargo build --release
+cd esp-idf-build && cargo build --release
 
-## Structure
-
-Each MCP is a standalone Rust project in its own folder:
-```
-claude-mcps/
-├── embedded-probe/     # Embedded debugging MCP
-└── <future-mcp>/       # Additional MCPs go here
+# Python server
+cd saleae-logic && pip install -e .
 ```
 
 ## Adding a New MCP Server
 
 1. Create folder: `mkdir my-mcp && cd my-mcp && cargo init`
-2. Implement MCP server using rmcp or similar
-3. Document in this file
+2. Implement MCP server using rmcp (Rust) or similar
+3. Add a `CLAUDE.md` with tool documentation
+4. Register in workspace `.mcp.json`
