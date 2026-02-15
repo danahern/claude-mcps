@@ -1,9 +1,12 @@
-//! ELF core dump generation for ARM Cortex-M targets.
+//! Core dump generation and analysis for ARM Cortex-M targets.
 //!
-//! Produces GDB-compatible ELF core files with NT_PRSTATUS notes
-//! and PT_LOAD segments for RAM regions.
+//! Two capabilities:
+//! 1. **ELF core dump generation** — produces GDB-compatible ELF core files
+//! 2. **Zephyr coredump parsing** — parses `#CD:` prefixed hex lines from Zephyr's
+//!    logging-based coredump backend and produces crash analysis reports
 
 use std::io::Write;
+use crate::symbols::SymbolTable;
 
 // ELF constants
 const ELFMAG: [u8; 4] = [0x7f, b'E', b'L', b'F'];
@@ -175,6 +178,372 @@ fn align4(val: u32) -> u32 {
     (val + 3) & !3
 }
 
+// =============================================================================
+// Zephyr Coredump Parser (#CD: log format)
+// =============================================================================
+
+/// Zephyr coredump target codes
+const COREDUMP_TGT_ARM_CORTEX_M: u16 = 3;
+
+/// Zephyr coredump reason codes
+fn reason_string(code: u32) -> &'static str {
+    match code {
+        0 => "K_ERR_CPU_EXCEPTION",
+        1 => "K_ERR_SPURIOUS_IRQ",
+        2 => "K_ERR_STACK_CHK_FAIL",
+        3 => "K_ERR_KERNEL_OOPS",
+        4 => "K_ERR_KERNEL_PANIC",
+        _ => "Unknown",
+    }
+}
+
+/// ARM Cortex-M registers extracted from a Zephyr coredump.
+///
+/// Register order in the coredump (v1: 9 regs, v2: 17 regs):
+///   R0, R1, R2, R3, R12, LR, PC, xPSR, SP, [R4-R11 in v2]
+#[derive(Debug, Default)]
+pub struct ZephyrCortexMRegs {
+    pub r0: u32,
+    pub r1: u32,
+    pub r2: u32,
+    pub r3: u32,
+    pub r4: u32,
+    pub r5: u32,
+    pub r6: u32,
+    pub r7: u32,
+    pub r8: u32,
+    pub r9: u32,
+    pub r10: u32,
+    pub r11: u32,
+    pub r12: u32,
+    pub sp: u32,
+    pub lr: u32,
+    pub pc: u32,
+    pub xpsr: u32,
+}
+
+/// Parsed Zephyr coredump data.
+#[derive(Debug)]
+pub struct ZephyrCoredump {
+    pub reason: &'static str,
+    pub registers: ZephyrCortexMRegs,
+    pub memory_regions: Vec<(u64, Vec<u8>)>,
+}
+
+/// Extract `#CD:` prefixed hex data from log text and concatenate into raw bytes.
+fn extract_coredump_bytes(log_text: &str) -> Result<Vec<u8>, String> {
+    let mut hex_data = String::new();
+    let mut in_coredump = false;
+
+    for line in log_text.lines() {
+        // Find #CD: prefix (may have log prefixes before it)
+        if let Some(pos) = line.find("#CD:") {
+            let after_prefix = &line[pos + 4..];
+            let trimmed = after_prefix.trim();
+            if trimmed == "BEGIN#" {
+                in_coredump = true;
+                continue;
+            }
+            if trimmed == "END#" {
+                break;
+            }
+            if in_coredump {
+                hex_data.push_str(trimmed);
+            }
+        }
+    }
+
+    if hex_data.is_empty() {
+        return Err("No #CD: coredump data found in log text".to_string());
+    }
+
+    hex::decode(&hex_data).map_err(|e| format!("Failed to decode coredump hex data: {}", e))
+}
+
+/// Read a little-endian u16 from a byte slice at the given offset.
+fn read_u16_le(data: &[u8], offset: usize) -> Result<u16, String> {
+    if offset + 2 > data.len() {
+        return Err(format!("Unexpected end of data at offset {}", offset));
+    }
+    Ok(u16::from_le_bytes([data[offset], data[offset + 1]]))
+}
+
+/// Read a little-endian u32 from a byte slice at the given offset.
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, String> {
+    if offset + 4 > data.len() {
+        return Err(format!("Unexpected end of data at offset {}", offset));
+    }
+    Ok(u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]))
+}
+
+/// Parse `#CD:` prefixed lines from log text into a `ZephyrCoredump`.
+pub fn parse_zephyr_coredump(log_text: &str) -> Result<ZephyrCoredump, String> {
+    let data = extract_coredump_bytes(log_text)?;
+
+    // --- File header (12 bytes) ---
+    if data.len() < 12 {
+        return Err("Coredump data too short for file header".to_string());
+    }
+    if data[0] != b'Z' || data[1] != b'E' {
+        return Err(format!(
+            "Invalid coredump magic: expected 'ZE', got '{}{}'",
+            data[0] as char, data[1] as char
+        ));
+    }
+    let _hdr_version = read_u16_le(&data, 2)?;
+    let tgt_code = read_u16_le(&data, 4)?;
+    if tgt_code != COREDUMP_TGT_ARM_CORTEX_M {
+        return Err(format!(
+            "Unsupported target code: {} (only ARM Cortex-M = {} supported)",
+            tgt_code, COREDUMP_TGT_ARM_CORTEX_M
+        ));
+    }
+    let ptr_size_bits = data[6];
+    let ptr_size = if ptr_size_bits == 5 { 4usize } else if ptr_size_bits == 6 { 8 } else {
+        return Err(format!("Unsupported pointer size bits: {}", ptr_size_bits));
+    };
+    let reason_code = read_u32_le(&data, 8)?;
+    let reason = reason_string(reason_code);
+
+    let mut offset = 12;
+    let mut registers = ZephyrCortexMRegs::default();
+    let mut memory_regions = Vec::new();
+
+    // Parse blocks until end of data
+    while offset < data.len() {
+        if data.len() - offset < 1 {
+            break;
+        }
+        let block_id = data[offset] as char;
+
+        match block_id {
+            // Architecture block: 'A' + version(u16) + num_bytes(u16) + register data
+            'A' => {
+                if offset + 5 > data.len() {
+                    return Err("Truncated architecture block header".to_string());
+                }
+                let arch_version = read_u16_le(&data, offset + 1)?;
+                let num_bytes = read_u16_le(&data, offset + 3)? as usize;
+                offset += 5; // skip header
+
+                if offset + num_bytes > data.len() {
+                    return Err("Truncated architecture block data".to_string());
+                }
+
+                // Parse registers based on version
+                let reg_data = &data[offset..offset + num_bytes];
+                let num_regs = num_bytes / 4;
+
+                // v1 order (9 regs): R0,R1,R2,R3,R12,LR,PC,xPSR,SP
+                // v2 order (17 regs): R0,R1,R2,R3,R12,LR,PC,xPSR,SP,R4,R5,R6,R7,R8,R9,R10,R11
+                if num_regs >= 9 {
+                    registers.r0 = read_u32_le(reg_data, 0)?;
+                    registers.r1 = read_u32_le(reg_data, 4)?;
+                    registers.r2 = read_u32_le(reg_data, 8)?;
+                    registers.r3 = read_u32_le(reg_data, 12)?;
+                    registers.r12 = read_u32_le(reg_data, 16)?;
+                    registers.lr = read_u32_le(reg_data, 20)?;
+                    registers.pc = read_u32_le(reg_data, 24)?;
+                    registers.xpsr = read_u32_le(reg_data, 28)?;
+                    registers.sp = read_u32_le(reg_data, 32)?;
+                }
+                if num_regs >= 17 && arch_version >= 2 {
+                    registers.r4 = read_u32_le(reg_data, 36)?;
+                    registers.r5 = read_u32_le(reg_data, 40)?;
+                    registers.r6 = read_u32_le(reg_data, 44)?;
+                    registers.r7 = read_u32_le(reg_data, 48)?;
+                    registers.r8 = read_u32_le(reg_data, 52)?;
+                    registers.r9 = read_u32_le(reg_data, 56)?;
+                    registers.r10 = read_u32_le(reg_data, 60)?;
+                    registers.r11 = read_u32_le(reg_data, 64)?;
+                }
+
+                offset += num_bytes;
+            }
+
+            // Memory block: 'M' + version(u16) + start(ptr) + end(ptr) + data
+            'M' => {
+                if offset + 3 > data.len() {
+                    return Err("Truncated memory block header".to_string());
+                }
+                let _mem_version = read_u16_le(&data, offset + 1)?;
+                offset += 3; // skip id + version
+
+                if ptr_size == 4 {
+                    if offset + 8 > data.len() {
+                        return Err("Truncated memory block addresses".to_string());
+                    }
+                    let start = read_u32_le(&data, offset)? as u64;
+                    let end = read_u32_le(&data, offset + 4)? as u64;
+                    offset += 8;
+
+                    let size = (end - start) as usize;
+                    if offset + size > data.len() {
+                        return Err(format!(
+                            "Truncated memory block data: need {} bytes at offset {}, have {}",
+                            size, offset, data.len() - offset
+                        ));
+                    }
+                    memory_regions.push((start, data[offset..offset + size].to_vec()));
+                    offset += size;
+                } else {
+                    // 64-bit pointers
+                    if offset + 16 > data.len() {
+                        return Err("Truncated memory block addresses (64-bit)".to_string());
+                    }
+                    let start_lo = read_u32_le(&data, offset)? as u64;
+                    let start_hi = read_u32_le(&data, offset + 4)? as u64;
+                    let end_lo = read_u32_le(&data, offset + 8)? as u64;
+                    let end_hi = read_u32_le(&data, offset + 12)? as u64;
+                    let start = start_lo | (start_hi << 32);
+                    let end = end_lo | (end_hi << 32);
+                    offset += 16;
+
+                    let size = (end - start) as usize;
+                    if offset + size > data.len() {
+                        return Err("Truncated memory block data (64-bit)".to_string());
+                    }
+                    memory_regions.push((start, data[offset..offset + size].to_vec()));
+                    offset += size;
+                }
+            }
+
+            // Threads metadata block: 'T' + version(u16) + num_bytes(u16) + data (skip)
+            'T' => {
+                if offset + 5 > data.len() {
+                    return Err("Truncated threads metadata header".to_string());
+                }
+                let num_bytes = read_u16_le(&data, offset + 3)? as usize;
+                offset += 5 + num_bytes;
+            }
+
+            _ => {
+                // Unknown block — can't determine size, stop parsing
+                break;
+            }
+        }
+    }
+
+    Ok(ZephyrCoredump {
+        reason,
+        registers,
+        memory_regions,
+    })
+}
+
+/// Format a crash analysis report with symbol resolution from an ELF file.
+pub fn format_crash_report(dump: &ZephyrCoredump, symbols: &SymbolTable) -> String {
+    let regs = &dump.registers;
+    let mut report = String::new();
+
+    report.push_str("=== Crash Analysis Report ===\n\n");
+    report.push_str(&format!("Fault reason: {}\n", dump.reason));
+
+    // Crash PC with symbol
+    let pc_sym = symbols.resolve(regs.pc as u64);
+    report.push_str(&format!("Crash PC:     0x{:08X}", regs.pc));
+    if let Some(ref sym) = pc_sym {
+        report.push_str(&format!(" → {}", sym));
+    }
+    report.push('\n');
+
+    // Caller (LR) with symbol
+    let lr_sym = symbols.resolve(regs.lr as u64);
+    report.push_str(&format!("Caller (LR):  0x{:08X}", regs.lr));
+    if let Some(ref sym) = lr_sym {
+        report.push_str(&format!(" → {}", sym));
+    }
+    report.push('\n');
+
+    report.push_str(&format!("Stack (SP):   0x{:08X}\n", regs.sp));
+
+    // Register dump
+    report.push_str("\nRegister Dump:\n");
+    report.push_str(&format!(
+        "  R0:  0x{:08X}   R1:  0x{:08X}   R2:  0x{:08X}   R3:  0x{:08X}\n",
+        regs.r0, regs.r1, regs.r2, regs.r3
+    ));
+    report.push_str(&format!(
+        "  R4:  0x{:08X}   R5:  0x{:08X}   R6:  0x{:08X}   R7:  0x{:08X}\n",
+        regs.r4, regs.r5, regs.r6, regs.r7
+    ));
+    report.push_str(&format!(
+        "  R8:  0x{:08X}   R9:  0x{:08X}   R10: 0x{:08X}   R11: 0x{:08X}\n",
+        regs.r8, regs.r9, regs.r10, regs.r11
+    ));
+    report.push_str(&format!(
+        "  R12: 0x{:08X}   SP:  0x{:08X}   LR:  0x{:08X}   PC:  0x{:08X}\n",
+        regs.r12, regs.sp, regs.lr, regs.pc
+    ));
+    report.push_str(&format!("  xPSR: 0x{:08X}\n", regs.xpsr));
+
+    // Call chain from LR/stack
+    report.push_str("\nCall chain (from exception frame):\n");
+    report.push_str(&format!("  #0 0x{:08X} ", regs.pc));
+    if let Some(ref sym) = pc_sym {
+        report.push_str(&format!("{:<40}", format!("{}", sym)));
+    } else {
+        report.push_str(&format!("{:<40}", "???"));
+    }
+    report.push_str(" ← CRASH HERE\n");
+
+    report.push_str(&format!("  #1 0x{:08X} ", regs.lr));
+    if let Some(ref sym) = lr_sym {
+        report.push_str(&format!("{}", sym));
+    } else {
+        report.push_str("???");
+    }
+    report.push('\n');
+
+    // Try to walk stack for more frames if we have memory data covering SP
+    let mut frame_idx = 2;
+    if let Some(region) = dump.memory_regions.iter().find(|(base, data)| {
+        let end = *base + data.len() as u64;
+        (regs.sp as u64) >= *base && (regs.sp as u64) < end
+    }) {
+        let (base, data) = region;
+        let sp_offset = (regs.sp as u64 - base) as usize;
+        // Scan stack words for potential return addresses
+        let mut pos = sp_offset;
+        while pos + 4 <= data.len() && frame_idx < 10 {
+            let word = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            // Check if this looks like a Thumb return address (odd, in code range)
+            if word & 1 == 1 && word >= 0x00000100 && word < 0x20000000 {
+                if let Some(sym) = symbols.resolve(word as u64) {
+                    report.push_str(&format!("  #{} 0x{:08X} {}\n", frame_idx, word, sym));
+                    frame_idx += 1;
+                }
+            }
+            pos += 4;
+        }
+    }
+
+    // Memory region summary
+    if !dump.memory_regions.is_empty() {
+        report.push_str(&format!(
+            "\nMemory regions captured: {} (",
+            dump.memory_regions.len()
+        ));
+        let parts: Vec<String> = dump.memory_regions.iter().map(|(base, data)| {
+            let size = data.len();
+            if size >= 1024 {
+                format!("{} KB from 0x{:08X}", size / 1024, base)
+            } else {
+                format!("{} bytes from 0x{:08X}", size, base)
+            }
+        }).collect();
+        report.push_str(&parts.join(", "));
+        report.push_str(")\n");
+    }
+
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,5 +685,185 @@ mod tests {
         assert_eq!(phnum, 1);
         // Magic is still valid
         assert_eq!(&buf[0..4], &ELFMAG);
+    }
+
+    // =========================================================================
+    // Zephyr Coredump Parser Tests
+    // =========================================================================
+
+    /// Build a synthetic Zephyr coredump binary and encode as #CD: log lines.
+    fn build_coredump_log(
+        reason: u32,
+        regs_v2: &[u32; 17], // R0,R1,R2,R3,R12,LR,PC,xPSR,SP,R4-R11
+        memory: Option<(u32, &[u8])>,
+    ) -> String {
+        let mut bin = Vec::new();
+
+        // File header: 'Z','E', version=2, tgt=ARM_CORTEX_M(3), ptr_size_bits=5(32-bit), flag=0, reason
+        bin.extend_from_slice(&[b'Z', b'E']);
+        bin.extend_from_slice(&2u16.to_le_bytes()); // hdr_version
+        bin.extend_from_slice(&3u16.to_le_bytes()); // tgt_code = ARM_CORTEX_M
+        bin.push(5); // ptr_size_bits = 5 (32-bit)
+        bin.push(0); // flag
+        bin.extend_from_slice(&reason.to_le_bytes()); // reason
+
+        // Architecture block: 'A', version=2, num_bytes=68 (17 regs * 4)
+        bin.push(b'A');
+        bin.extend_from_slice(&2u16.to_le_bytes()); // hdr_version
+        bin.extend_from_slice(&68u16.to_le_bytes()); // num_bytes
+        for reg in regs_v2 {
+            bin.extend_from_slice(&reg.to_le_bytes());
+        }
+
+        // Memory block if provided
+        if let Some((base, data)) = memory {
+            let end = base + data.len() as u32;
+            bin.push(b'M');
+            bin.extend_from_slice(&1u16.to_le_bytes()); // hdr_version
+            bin.extend_from_slice(&base.to_le_bytes()); // start
+            bin.extend_from_slice(&end.to_le_bytes()); // end
+            bin.extend_from_slice(data);
+        }
+
+        // Encode as #CD: log lines (64 hex chars = 32 bytes per line)
+        let hex_str = hex::encode(&bin);
+        let mut log = String::new();
+        log.push_str("[00:00:00.000,000] <inf> coredump: #CD:BEGIN#\n");
+        for chunk in hex_str.as_bytes().chunks(64) {
+            log.push_str("[00:00:00.000,000] <inf> coredump: #CD:");
+            log.push_str(std::str::from_utf8(chunk).unwrap());
+            log.push('\n');
+        }
+        log.push_str("[00:00:00.000,000] <inf> coredump: #CD:END#\n");
+        log
+    }
+
+    #[test]
+    fn test_parse_zephyr_coredump_registers() {
+        // v2 order: R0,R1,R2,R3,R12,LR,PC,xPSR,SP,R4,R5,R6,R7,R8,R9,R10,R11
+        let regs = [
+            0x00000000, // R0
+            0x0002B100, // R1
+            0x0000BEEF, // R2
+            0x00000003, // R3
+            0x0000000C, // R12
+            0x0002A3E1, // LR
+            0x0002A3F4, // PC
+            0x61000000, // xPSR
+            0x2000FE80, // SP
+            0x20001234, // R4
+            0x00000005, // R5
+            0x00000006, // R6
+            0x2000FEA0, // R7
+            0x00000008, // R8
+            0x00000009, // R9
+            0x0000000A, // R10
+            0x0000000B, // R11
+        ];
+
+        let log = build_coredump_log(0, &regs, None);
+        let dump = parse_zephyr_coredump(&log).unwrap();
+
+        assert_eq!(dump.reason, "K_ERR_CPU_EXCEPTION");
+        assert_eq!(dump.registers.pc, 0x0002A3F4);
+        assert_eq!(dump.registers.lr, 0x0002A3E1);
+        assert_eq!(dump.registers.sp, 0x2000FE80);
+        assert_eq!(dump.registers.r0, 0x00000000);
+        assert_eq!(dump.registers.r2, 0x0000BEEF);
+        assert_eq!(dump.registers.r4, 0x20001234);
+        assert_eq!(dump.registers.r7, 0x2000FEA0);
+        assert_eq!(dump.registers.xpsr, 0x61000000);
+    }
+
+    #[test]
+    fn test_parse_zephyr_coredump_with_memory() {
+        let regs = [0u32; 17];
+        let ram_data = vec![0xAA; 64];
+        let log = build_coredump_log(0, &regs, Some((0x20000000, &ram_data)));
+        let dump = parse_zephyr_coredump(&log).unwrap();
+
+        assert_eq!(dump.memory_regions.len(), 1);
+        assert_eq!(dump.memory_regions[0].0, 0x20000000);
+        assert_eq!(dump.memory_regions[0].1.len(), 64);
+        assert!(dump.memory_regions[0].1.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn test_parse_zephyr_coredump_reason_codes() {
+        let regs = [0u32; 17];
+        for (code, expected) in [
+            (0, "K_ERR_CPU_EXCEPTION"),
+            (1, "K_ERR_SPURIOUS_IRQ"),
+            (2, "K_ERR_STACK_CHK_FAIL"),
+            (3, "K_ERR_KERNEL_OOPS"),
+            (4, "K_ERR_KERNEL_PANIC"),
+            (99, "Unknown"),
+        ] {
+            let log = build_coredump_log(code, &regs, None);
+            let dump = parse_zephyr_coredump(&log).unwrap();
+            assert_eq!(dump.reason, expected);
+        }
+    }
+
+    #[test]
+    fn test_parse_zephyr_coredump_no_data() {
+        let result = parse_zephyr_coredump("some random log output\nno coredump here");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("No #CD: coredump data found"));
+    }
+
+    #[test]
+    fn test_parse_zephyr_coredump_bad_magic() {
+        let log = "#CD:BEGIN#\n#CD:4242020003000500000000000000\n#CD:END#\n";
+        let result = parse_zephyr_coredump(log);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid coredump magic"));
+    }
+
+    #[test]
+    fn test_parse_zephyr_coredump_with_log_prefixes() {
+        // Simulate real RTT output with Zephyr log prefixes
+        let regs = [0x11111111u32; 17];
+        let log = build_coredump_log(0, &regs, None);
+        let dump = parse_zephyr_coredump(&log).unwrap();
+        assert_eq!(dump.registers.r0, 0x11111111);
+    }
+
+    #[test]
+    fn test_format_crash_report_with_symbols() {
+        let regs = [
+            0x00000000, 0x0002B100, 0x0000BEEF, 0x00000003,
+            0x0000000C, 0x0002A3E1, 0x0002A3F4, 0x61000000,
+            0x2000FE80, 0x20001234, 0, 0, 0x2000FEA0, 0, 0, 0, 0,
+        ];
+        let log = build_coredump_log(0, &regs, None);
+        let dump = parse_zephyr_coredump(&log).unwrap();
+
+        let symbols = SymbolTable::from_entries(vec![
+            ("sensor_read_register", 0x0002A3EC, 16),
+            ("sensor_process_data", 0x0002A3C4, 40),
+            ("sensor_init_sequence", 0x0002A3B4, 16),
+            ("main", 0x0002A380, 52),
+        ]);
+
+        let report = format_crash_report(&dump, &symbols);
+        assert!(report.contains("Crash PC:     0x0002A3F4"));
+        assert!(report.contains("sensor_read_register"));
+        assert!(report.contains("Caller (LR):  0x0002A3E1"));
+        assert!(report.contains("sensor_process_data"));
+        assert!(report.contains("CRASH HERE"));
+        assert!(report.contains("K_ERR_CPU_EXCEPTION"));
+    }
+
+    #[test]
+    fn test_format_crash_report_no_symbols() {
+        let regs = [0u32; 17];
+        let log = build_coredump_log(3, &regs, None);
+        let dump = parse_zephyr_coredump(&log).unwrap();
+
+        let symbols = SymbolTable::from_entries(vec![]);
+        let report = format_crash_report(&dump, &symbols);
+        assert!(report.contains("K_ERR_KERNEL_OOPS"));
+        assert!(report.contains("???"));
     }
 }

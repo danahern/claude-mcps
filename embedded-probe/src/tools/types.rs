@@ -482,6 +482,18 @@ pub struct LoadCustomTargetArgs {
 }
 
 // =============================================================================
+// Coredump Analysis Types
+// =============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeCoredumpArgs {
+    /// Raw log/RTT text containing #CD: prefixed coredump lines
+    pub log_text: String,
+    /// Path to ELF firmware file for symbol resolution
+    pub elf_path: String,
+}
+
+// =============================================================================
 // Advanced Debugging Types
 // =============================================================================
 

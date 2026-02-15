@@ -2693,6 +2693,27 @@ except Exception as e:
         }
     }
 
+    #[tool(description = "Analyze a Zephyr coredump from RTT/log output. Parses #CD: prefixed hex lines from Zephyr's coredump logging backend, extracts crash registers (PC, LR, SP from the exception frame — the actual crash site), resolves symbols from an ELF file, and returns a human-readable crash report. This is the fastest way to diagnose a crash: one tool call that answers 'what crashed and why' without GDB.")]
+    async fn analyze_coredump(&self, Parameters(args): Parameters<AnalyzeCoredumpArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Analyzing Zephyr coredump from log text");
+
+        // Parse the coredump from #CD: lines
+        let dump = crate::coredump::parse_zephyr_coredump(&args.log_text)
+            .map_err(|e| McpError::internal_error(
+                format!("Failed to parse coredump: {}\n\nExpected #CD:BEGIN# ... #CD:END# lines in the log text.", e), None))?;
+
+        // Load symbols from ELF
+        let symbols = SymbolTable::from_elf(std::path::Path::new(&args.elf_path))
+            .map_err(|e| McpError::internal_error(
+                format!("Failed to load symbols from ELF '{}': {}", args.elf_path, e), None))?;
+
+        info!("Parsed coredump: reason={}, {} memory regions, {} symbols loaded",
+            dump.reason, dump.memory_regions.len(), symbols.symbol_count());
+
+        let report = crate::coredump::format_crash_report(&dump, &symbols);
+        Ok(CallToolResult::success(vec![Content::text(report)]))
+    }
+
     #[tool(description = "Start a GDB server (probe-rs gdb) for connecting with arm-none-eabi-gdb or other GDB clients. Important: disconnect any active debug session on the same probe first, as the GDB server opens its own probe connection.")]
     async fn gdb_server(&self, Parameters(args): Parameters<GdbServerArgs>) -> Result<CallToolResult, McpError> {
         debug!("Starting GDB server for chip {} on port {}", args.target_chip, args.port);
@@ -2965,7 +2986,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, GDB server, RTT communication, and flash programming with real hardware integration. All 35 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, load_custom_target.".to_string()),
+            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, Zephyr coredump analysis, GDB server, RTT communication, and flash programming with real hardware integration. All 36 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, analyze_coredump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, load_custom_target.".to_string()),
         }
     }
 
@@ -2974,7 +2995,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Complete Embedded Debugger MCP server initialized with all 35 tools");
+        info!("Complete Embedded Debugger MCP server initialized with all 36 tools");
         Ok(self.get_info())
     }
 }
