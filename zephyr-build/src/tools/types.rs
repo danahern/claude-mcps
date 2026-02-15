@@ -117,6 +117,50 @@ pub struct CleanResult {
 }
 
 // ============================================================================
+// build_all
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BuildAllArgs {
+    /// Board identifier (e.g., "nrf52840dk/nrf52840")
+    pub board: String,
+    /// Use --pristine flag for clean builds
+    #[serde(default)]
+    pub pristine: bool,
+    /// Override workspace path
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BuildAllResult {
+    /// Total number of apps found
+    pub total: usize,
+    /// Number of successful builds
+    pub succeeded: usize,
+    /// Number of failed builds
+    pub failed: usize,
+    /// Results for each app
+    pub results: Vec<AppBuildResult>,
+    /// Total duration in milliseconds
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AppBuildResult {
+    /// Application name
+    pub app: String,
+    /// Whether the build succeeded
+    pub success: bool,
+    /// Path to built artifact (if successful)
+    pub artifact_path: Option<String>,
+    /// Error output (if failed)
+    pub error: Option<String>,
+    /// Build duration in milliseconds
+    pub duration_ms: u64,
+}
+
+// ============================================================================
 // build_status
 // ============================================================================
 

@@ -34,6 +34,7 @@ mod tests {
     fn test_args_parsing_defaults() {
         let args = Args::parse_from(["zephyr-build"]);
         assert!(args.workspace.is_none());
+        assert!(args.apps_dir.is_none());
         assert_eq!(args.log_level, "info");
         assert!(args.log_file.is_none());
     }
@@ -43,6 +44,12 @@ mod tests {
         let args = Args::parse_from(["zephyr-build", "--workspace", "/tmp/ws", "--log-level", "debug"]);
         assert_eq!(args.workspace.unwrap().to_str().unwrap(), "/tmp/ws");
         assert_eq!(args.log_level, "debug");
+    }
+
+    #[test]
+    fn test_args_parsing_with_apps_dir() {
+        let args = Args::parse_from(["zephyr-build", "--apps-dir", "my-apps/src"]);
+        assert_eq!(args.apps_dir.unwrap(), "my-apps/src");
     }
 
     #[test]
@@ -57,6 +64,20 @@ mod tests {
         let args = Args::parse_from(["zephyr-build", "--workspace", "/tmp/ws"]);
         let config = Config::from_args(&args);
         assert_eq!(config.workspace_path.unwrap().to_str().unwrap(), "/tmp/ws");
+        assert_eq!(config.apps_dir, "zephyr-apps/apps");
+    }
+
+    #[test]
+    fn test_config_from_args_with_apps_dir() {
+        let args = Args::parse_from(["zephyr-build", "--apps-dir", "custom/apps"]);
+        let config = Config::from_args(&args);
+        assert_eq!(config.apps_dir, "custom/apps");
+    }
+
+    #[test]
+    fn test_config_from_args_no_apps_dir_uses_default() {
+        let args = Args::parse_from(["zephyr-build"]);
+        let config = Config::from_args(&args);
         assert_eq!(config.apps_dir, "zephyr-apps/apps");
     }
 

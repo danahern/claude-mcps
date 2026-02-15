@@ -1,6 +1,6 @@
 //! Complete RMCP 0.3.2 implementation for Zephyr build MCP tools
 //!
-//! This implementation provides 5 build tools using west CLI subprocess calls
+//! This implementation provides 6 build tools using west CLI subprocess calls
 
 use rmcp::{
     tool, tool_router, tool_handler, ServerHandler,
@@ -56,7 +56,7 @@ pub enum BuildStatus {
     Failed,
 }
 
-/// Zephyr build tool handler with all 5 tools
+/// Zephyr build tool handler with all 6 tools
 #[derive(Clone)]
 pub struct ZephyrBuildToolHandler {
     #[allow(dead_code)]
@@ -162,7 +162,7 @@ impl Default for ZephyrBuildToolHandler {
 #[tool_router]
 impl ZephyrBuildToolHandler {
     // =============================================================================
-    // Build Tools (5 tools)
+    // Build Tools (6 tools)
     // =============================================================================
 
     #[tool(description = "List available Zephyr applications in the workspace")]
@@ -458,6 +458,138 @@ impl ZephyrBuildToolHandler {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
+    #[tool(description = "Build all applications in the workspace for a target board")]
+    async fn build_all(&self, Parameters(args): Parameters<BuildAllArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Building all apps for board '{}'", args.board);
+
+        let workspace = self.find_workspace(args.workspace_path.as_deref())?;
+        let apps_dir = self.get_apps_dir(&workspace);
+
+        if !apps_dir.exists() {
+            return Err(McpError::internal_error(
+                format!("Apps directory not found: {}", apps_dir.display()),
+                None,
+            ));
+        }
+
+        // Discover apps (same logic as list_apps)
+        let mut app_names = Vec::new();
+        let entries = std::fs::read_dir(&apps_dir).map_err(|e| {
+            McpError::internal_error(format!("Failed to read apps directory: {}", e), None)
+        })?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path.join("CMakeLists.txt").exists() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    app_names.push(name.to_string());
+                }
+            }
+        }
+        app_names.sort();
+
+        if app_names.is_empty() {
+            return Err(McpError::internal_error(
+                format!("No applications found in {}", apps_dir.display()),
+                None,
+            ));
+        }
+
+        info!("Building {} apps for board '{}'", app_names.len(), args.board);
+
+        let total_start = Instant::now();
+        let mut results = Vec::new();
+
+        for app_name in &app_names {
+            let app_path = apps_dir.join(app_name);
+            let build_dir = app_path.join("build");
+
+            let mut cmd_args = vec![
+                "build".to_string(),
+                "-b".to_string(),
+                args.board.clone(),
+                app_path.to_string_lossy().to_string(),
+                "-d".to_string(),
+                build_dir.to_string_lossy().to_string(),
+            ];
+
+            if args.pristine {
+                cmd_args.push("--pristine".to_string());
+            }
+
+            info!("Building {}: west {}", app_name, cmd_args.join(" "));
+            let start = Instant::now();
+
+            let output = Command::new("west")
+                .args(&cmd_args)
+                .current_dir(&workspace)
+                .output()
+                .await;
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            match output {
+                Ok(out) => {
+                    if out.status.success() {
+                        let artifact = app_path.join("build/zephyr/zephyr.elf");
+                        let artifact_path = if artifact.exists() {
+                            Some(artifact.to_string_lossy().to_string())
+                        } else {
+                            None
+                        };
+                        info!("  {} succeeded in {}ms", app_name, duration_ms);
+                        results.push(AppBuildResult {
+                            app: app_name.clone(),
+                            success: true,
+                            artifact_path,
+                            error: None,
+                            duration_ms,
+                        });
+                    } else {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        error!("  {} failed", app_name);
+                        results.push(AppBuildResult {
+                            app: app_name.clone(),
+                            success: false,
+                            artifact_path: None,
+                            error: Some(stderr.to_string()),
+                            duration_ms,
+                        });
+                    }
+                }
+                Err(e) => {
+                    error!("  {} failed to execute: {}", app_name, e);
+                    results.push(AppBuildResult {
+                        app: app_name.clone(),
+                        success: false,
+                        artifact_path: None,
+                        error: Some(format!("Failed to execute west: {}", e)),
+                        duration_ms,
+                    });
+                }
+            }
+        }
+
+        let total_duration_ms = total_start.elapsed().as_millis() as u64;
+        let succeeded = results.iter().filter(|r| r.success).count();
+        let failed = results.iter().filter(|r| !r.success).count();
+
+        let result = BuildAllResult {
+            total: results.len(),
+            succeeded,
+            failed,
+            results,
+            duration_ms: total_duration_ms,
+        };
+
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        info!("Build all complete: {}/{} succeeded in {}ms", succeeded, result.total, total_duration_ms);
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
     #[tool(description = "Clean build artifacts for a Zephyr application")]
     async fn clean(&self, Parameters(args): Parameters<CleanArgs>) -> Result<CallToolResult, McpError> {
         debug!("Cleaning build for app '{}'", args.app);
@@ -702,6 +834,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_build_all_no_apps_dir() {
+        let tmp = TempDir::new().unwrap();
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .build_all(Parameters(BuildAllArgs {
+                board: "nrf52840dk/nrf52840".to_string(),
+                pristine: false,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_build_all_empty_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        fs::create_dir_all(&apps_dir).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .build_all(Parameters(BuildAllArgs {
+                board: "nrf52840dk/nrf52840".to_string(),
+                pristine: false,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_clean_app_no_build_dir() {
         let tmp = TempDir::new().unwrap();
         let apps_dir = tmp.path().join("zephyr-apps/apps");
@@ -736,7 +907,7 @@ impl ServerHandler for ZephyrBuildToolHandler {
             server_info: Implementation::from_build_env(),
             instructions: Some(
                 "Zephyr Build MCP Server - Build Zephyr RTOS applications. \
-                 5 tools available: list_apps, list_boards, build, clean, build_status.".to_string()
+                 6 tools available: list_apps, list_boards, build, build_all, clean, build_status.".to_string()
             ),
         }
     }
@@ -746,7 +917,7 @@ impl ServerHandler for ZephyrBuildToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Zephyr Build MCP server initialized with 5 tools");
+        info!("Zephyr Build MCP server initialized with 6 tools");
         Ok(self.get_info())
     }
 }

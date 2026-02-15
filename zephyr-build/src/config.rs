@@ -13,6 +13,10 @@ pub struct Args {
     #[arg(short, long)]
     pub workspace: Option<PathBuf>,
 
+    /// Applications directory relative to workspace (default: "zephyr-apps/apps")
+    #[arg(long)]
+    pub apps_dir: Option<String>,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -33,7 +37,7 @@ impl Config {
     pub fn from_args(args: &Args) -> Self {
         Self {
             workspace_path: args.workspace.clone(),
-            apps_dir: "zephyr-apps/apps".to_string(),
+            apps_dir: args.apps_dir.clone().unwrap_or_else(|| "zephyr-apps/apps".to_string()),
         }
     }
 }
