@@ -130,3 +130,33 @@ pub fn load_all_items(items_dir: &Path) -> Result<Vec<KnowledgeItem>, String> {
     items.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(items)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_id_format() {
+        assert_eq!(KnowledgeItem::generate_id("2026-02-16", 1), "k-2026-0216-001");
+        assert_eq!(KnowledgeItem::generate_id("2026-02-16", 5), "k-2026-0216-005");
+        assert_eq!(KnowledgeItem::generate_id("2026-12-01", 42), "k-2026-1201-042");
+    }
+
+    #[test]
+    fn generate_id_prefix_matches_output() {
+        // The prefix used in next_sequence must match IDs from generate_id
+        let date = "2026-02-16";
+        let compact = date.replace('-', "");
+        let prefix = format!("k-{}-{}-", &compact[..4], &compact[4..]);
+
+        let id1 = KnowledgeItem::generate_id(date, 1);
+        let id2 = KnowledgeItem::generate_id(date, 99);
+
+        assert!(id1.starts_with(&prefix), "{id1} should start with {prefix}");
+        assert!(id2.starts_with(&prefix), "{id2} should start with {prefix}");
+
+        // Different date should NOT match
+        let other_id = KnowledgeItem::generate_id("2026-02-15", 1);
+        assert!(!other_id.starts_with(&prefix), "{other_id} should NOT start with {prefix}");
+    }
+}

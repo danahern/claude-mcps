@@ -97,7 +97,13 @@ impl KnowledgeToolHandler {
     /// Get the next sequence number for a given date.
     async fn next_sequence(&self, date: &str) -> u32 {
         let items = self.items.read().await;
-        let prefix = format!("k-{}", date.replace('-', ""));
+        // generate_id produces "k-YYYY-MMDD-NNN", so build a matching prefix
+        let compact = date.replace('-', "");
+        let prefix = if compact.len() == 8 {
+            format!("k-{}-{}-", &compact[..4], &compact[4..])
+        } else {
+            format!("k-{}-", compact)
+        };
         let max_seq = items.keys()
             .filter(|id| id.starts_with(&prefix))
             .filter_map(|id| {
