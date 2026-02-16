@@ -27,8 +27,9 @@ pub struct AppInfo {
     pub path: String,
     /// Whether a build directory exists
     pub has_build: bool,
-    /// Board from last build (if available)
-    pub board: Option<String>,
+    /// Boards that have been built (from per-board build subdirectories)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_boards: Option<Vec<String>>,
     /// Description from manifest.yml
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -114,6 +115,9 @@ pub struct BuildResult {
 pub struct CleanArgs {
     /// Application name or path
     pub app: String,
+    /// Board to clean (e.g., "nrf52840dk/nrf52840"). If omitted, cleans all board builds.
+    #[serde(default)]
+    pub board: Option<String>,
     /// Override workspace path
     #[serde(default)]
     pub workspace_path: Option<String>,

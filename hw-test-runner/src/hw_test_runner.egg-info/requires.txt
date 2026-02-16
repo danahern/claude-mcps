@@ -1,0 +1,6 @@
+mcp>=1.0.0
+bleak>=0.21
+
+[dev]
+pytest>=7.0
+pytest-asyncio>=0.21

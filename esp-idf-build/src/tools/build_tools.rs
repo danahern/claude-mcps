@@ -714,6 +714,96 @@ impl EspIdfBuildToolHandler {
         info!("Monitor captured {}s of output for '{}'", args.duration_seconds, args.project);
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
+
+    #[tool(description = "Detect connected ESP32 devices by scanning serial ports and matching known USB-UART bridge VID/PIDs (CP2102, CH340, FTDI)")]
+    async fn detect_device(&self, Parameters(_args): Parameters<DetectDeviceArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Detecting ESP32 devices");
+
+        let devices = detect_esp32_devices().await;
+
+        let result = DetectDeviceResult { devices: devices.clone() };
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            McpError::internal_error(format!("Serialization error: {}", e), None)
+        })?;
+
+        info!("Detected {} ESP32 device(s)", devices.len());
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+}
+
+/// Known USB-UART bridge chips used on ESP32 dev boards
+const KNOWN_BRIDGES: &[(&str, &str, &str)] = &[
+    // (VID, PID, bridge chip name)
+    ("0x10c4", "0xea60", "CP2102/CP2104"),    // Silicon Labs — ESP32-DevKitC, most common
+    ("0x1a86", "0x7523", "CH340"),              // WCH — budget boards
+    ("0x1a86", "0x55d4", "CH9102"),             // WCH — newer variant
+    ("0x0403", "0x6001", "FTDI FT232"),         // FTDI — some boards
+    ("0x0403", "0x6010", "FTDI FT2232"),        // FTDI — dual-port variant
+    ("0x303a", "0x1001", "ESP32-S2 USB"),       // Espressif native USB
+    ("0x303a", "0x1002", "ESP32-S3 USB"),       // Espressif native USB
+];
+
+/// Detect ESP32 devices by scanning serial ports and matching USB VID/PIDs.
+/// On macOS, uses system_profiler SPUSBDataType to get VID/PID info.
+async fn detect_esp32_devices() -> Vec<DetectedDevice> {
+    let mut devices = Vec::new();
+
+    // Scan for serial port devices
+    let serial_ports: Vec<String> = std::fs::read_dir("/dev")
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("cu.usbserial") || name.starts_with("cu.usbmodem")
+                || name.starts_with("cu.SLAB") || name.starts_with("cu.wchusbserial")
+            {
+                Some(format!("/dev/{}", name))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if serial_ports.is_empty() {
+        return devices;
+    }
+
+    // Get USB device info via system_profiler (macOS)
+    let usb_info = tokio::process::Command::new("system_profiler")
+        .arg("SPUSBDataType")
+        .output()
+        .await
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    for port in &serial_ports {
+        let mut device = DetectedDevice {
+            port: port.clone(),
+            vid_pid: None,
+            bridge_chip: None,
+        };
+
+        // Try to match VID/PID from system_profiler output
+        if !usb_info.is_empty() {
+            for &(vid, pid, chip_name) in KNOWN_BRIDGES {
+                let vid_clean = vid.trim_start_matches("0x");
+                let pid_clean = pid.trim_start_matches("0x");
+                // system_profiler formats as "Vendor ID: 0x10c4" and "Product ID: 0xea60"
+                if usb_info.contains(&format!("Vendor ID: {}", vid))
+                    && usb_info.contains(&format!("Product ID: {}", pid))
+                {
+                    device.vid_pid = Some(format!("{}:{}", vid_clean, pid_clean));
+                    device.bridge_chip = Some(chip_name.to_string());
+                    break;
+                }
+            }
+        }
+
+        devices.push(device);
+    }
+
+    devices
 }
 
 /// Recursively scan for ESP-IDF projects (directories containing CMakeLists.txt with project())
@@ -908,6 +998,30 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_detect_device_returns_result() {
+        let handler = EspIdfBuildToolHandler::default();
+        let result = handler
+            .detect_device(Parameters(DetectDeviceArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        // Should return a devices array (may be empty if no ESP32 connected)
+        assert!(parsed["devices"].is_array());
+    }
+
+    #[test]
+    fn test_known_bridges_not_empty() {
+        assert!(!KNOWN_BRIDGES.is_empty());
+        // All entries should have non-empty fields
+        for &(vid, pid, name) in KNOWN_BRIDGES {
+            assert!(!vid.is_empty());
+            assert!(!pid.is_empty());
+            assert!(!name.is_empty());
+        }
+    }
 }
 
 #[tool_handler]
@@ -919,7 +1033,8 @@ impl ServerHandler for EspIdfBuildToolHandler {
             server_info: Implementation::from_build_env(),
             instructions: Some(
                 "ESP-IDF Build MCP Server - Build, flash, and monitor ESP-IDF applications. \
-                 8 tools available: list_projects, list_targets, set_target, build, flash, clean, build_status, monitor."
+                 9 tools available: list_projects, list_targets, set_target, build, flash, clean, \
+                 build_status, monitor, detect_device."
                     .to_string(),
             ),
         }
@@ -930,7 +1045,7 @@ impl ServerHandler for EspIdfBuildToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("ESP-IDF Build MCP server initialized with 8 tools");
+        info!("ESP-IDF Build MCP server initialized with 9 tools");
         Ok(self.get_info())
     }
 }

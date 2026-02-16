@@ -202,3 +202,26 @@ pub struct MonitorResult {
     /// Duration captured in seconds
     pub duration_seconds: u64,
 }
+
+// ============================================================================
+// detect_device
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DetectDeviceArgs {}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct DetectedDevice {
+    /// Serial port path (e.g., "/dev/cu.usbserial-1110")
+    pub port: String,
+    /// USB Vendor ID : Product ID (e.g., "10c4:ea60")
+    pub vid_pid: Option<String>,
+    /// USB-UART bridge chip name (e.g., "CP2102", "CH340")
+    pub bridge_chip: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DetectDeviceResult {
+    /// Detected devices
+    pub devices: Vec<DetectedDevice>,
+}

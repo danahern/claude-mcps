@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: hw-test-runner
+Version: 0.1.0
+Summary: Hardware test runner MCP server — BLE and TCP testing for embedded devices
+Requires-Python: >=3.10
+Requires-Dist: mcp>=1.0.0
+Requires-Dist: bleak>=0.21
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21; extra == "dev"

@@ -29,6 +29,40 @@ fn dirs_path() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Maximum output size in bytes before truncation kicks in
+const MAX_OUTPUT_BYTES: usize = 8192;
+/// Lines to keep from the start of output
+const HEAD_LINES: usize = 50;
+/// Lines to keep from the end of output
+const TAIL_LINES: usize = 100;
+
+/// Truncate build/test output to keep first HEAD_LINES and last TAIL_LINES,
+/// replacing the middle with a truncation notice. Returns the input unchanged
+/// if it's under MAX_OUTPUT_BYTES.
+fn truncate_output(output: &str) -> String {
+    if output.len() <= MAX_OUTPUT_BYTES {
+        return output.to_string();
+    }
+
+    let lines: Vec<&str> = output.lines().collect();
+    let total = lines.len();
+
+    if total <= HEAD_LINES + TAIL_LINES {
+        return output.to_string();
+    }
+
+    let head = &lines[..HEAD_LINES];
+    let tail = &lines[total - TAIL_LINES..];
+    let skipped = total - HEAD_LINES - TAIL_LINES;
+
+    format!(
+        "{}\n\n... [{} lines truncated] ...\n\n{}",
+        head.join("\n"),
+        skipped,
+        tail.join("\n")
+    )
+}
+
 /// Common boards for quick listing (without running west boards)
 const COMMON_BOARDS: &[(&str, &str, &str)] = &[
     ("nrf52840dk/nrf52840", "arm", "Nordic"),
@@ -195,10 +229,22 @@ impl ZephyrBuildToolHandler {
         None
     }
 
-    /// Create a twister Command with Zephyr SDK environment set
+    /// Create a twister Command with Zephyr SDK environment set.
+    /// Strips pyenv shims from PATH to prevent stderr noise that corrupts
+    /// cmake's JSON output (pyenv shim emits warnings that cmake merges
+    /// into stdout via stderr=subprocess.STDOUT in verify-toolchain.cmake).
     fn twister_command(workspace: &Path, cmd_args: &[String]) -> Command {
         let mut cmd = Command::new("python3");
         cmd.args(cmd_args).current_dir(workspace);
+
+        // Strip pyenv shims from PATH
+        if let Ok(path) = std::env::var("PATH") {
+            let cleaned: Vec<&str> = path
+                .split(':')
+                .filter(|p| !p.contains(".pyenv/shims"))
+                .collect();
+            cmd.env("PATH", cleaned.join(":"));
+        }
 
         // Set SDK env vars if not already in environment
         if std::env::var("ZEPHYR_TOOLCHAIN_VARIANT").is_err() {
@@ -258,6 +304,30 @@ impl ZephyrBuildToolHandler {
         })
     }
 
+    /// Get the per-board build directory for an app.
+    /// Converts board identifier slashes to underscores (e.g., "nrf52840dk/nrf52840" -> "nrf52840dk_nrf52840").
+    fn build_dir_for_board(app_path: &Path, board: &str) -> PathBuf {
+        let sanitized = board.replace('/', "_");
+        app_path.join("build").join(sanitized)
+    }
+
+    /// Symlink compile_commands.json from the build directory to the app source root.
+    /// Helps clangd find the compilation database and reduces false-positive diagnostics.
+    fn symlink_compile_commands(app_path: &Path, build_dir: &Path) {
+        let source = build_dir.join("compile_commands.json");
+        let target = app_path.join("compile_commands.json");
+        if source.exists() {
+            // Remove existing symlink/file
+            let _ = std::fs::remove_file(&target);
+            #[cfg(unix)]
+            {
+                if let Err(e) = std::os::unix::fs::symlink(&source, &target) {
+                    debug!("Failed to symlink compile_commands.json: {}", e);
+                }
+            }
+        }
+    }
+
     /// Read an app manifest from apps/<name>/manifest.yml (returns None if missing)
     fn read_app_manifest(app_path: &Path) -> Option<AppManifest> {
         let manifest_path = app_path.join("manifest.yml");
@@ -312,20 +382,22 @@ impl ZephyrBuildToolHandler {
                     let build_dir = path.join("build");
                     let has_build = build_dir.exists();
 
-                    // Try to get board from build cache
-                    let board = if has_build {
-                        let cache_file = build_dir.join("CMakeCache.txt");
-                        if cache_file.exists() {
-                            std::fs::read_to_string(&cache_file)
-                                .ok()
-                                .and_then(|content| {
-                                    content.lines()
-                                        .find(|line| line.starts_with("BOARD:STRING="))
-                                        .map(|line| line.replace("BOARD:STRING=", ""))
-                                })
-                        } else {
-                            None
+                    // Scan per-board build subdirectories
+                    let built_boards = if has_build {
+                        let mut boards = Vec::new();
+                        if let Ok(entries) = std::fs::read_dir(&build_dir) {
+                            for entry in entries.flatten() {
+                                let sub = entry.path();
+                                if sub.is_dir() && sub.join("zephyr").exists() {
+                                    if let Some(name) = sub.file_name().and_then(|n| n.to_str()) {
+                                        // Convert back from sanitized name
+                                        boards.push(name.to_string());
+                                    }
+                                }
+                            }
                         }
+                        boards.sort();
+                        if boards.is_empty() { None } else { Some(boards) }
                     } else {
                         None
                     };
@@ -341,7 +413,7 @@ impl ZephyrBuildToolHandler {
                         name,
                         path: rel_path,
                         has_build,
-                        board,
+                        built_boards,
                         description: manifest.as_ref().map(|m| m.description.clone()),
                         target_boards: manifest.as_ref().and_then(|m| {
                             if m.boards.is_empty() { None } else { Some(m.boards.clone()) }
@@ -431,8 +503,8 @@ impl ZephyrBuildToolHandler {
         let workspace = self.find_workspace(args.workspace_path.as_deref())?;
         let app_path = self.find_app_path(&workspace, &args.app)?;
 
-        // Per-app build directory so apps don't overwrite each other
-        let build_dir = app_path.join("build");
+        // Per-board build directory so boards don't overwrite each other
+        let build_dir = Self::build_dir_for_board(&app_path, &args.board);
 
         // Build the command
         let mut cmd_args = vec![
@@ -474,6 +546,7 @@ impl ZephyrBuildToolHandler {
             let builds = self.builds.clone();
             let build_id_clone = build_id.clone();
             let workspace_clone = workspace.clone();
+            let build_dir_clone = build_dir.clone();
             let app_path_clone = app_path.clone();
 
             tokio::spawn(async move {
@@ -490,13 +563,14 @@ impl ZephyrBuildToolHandler {
                         Ok(out) => {
                             let stdout = String::from_utf8_lossy(&out.stdout);
                             let stderr = String::from_utf8_lossy(&out.stderr);
-                            state.output = format!("{}\n{}", stdout, stderr);
+                            state.output = truncate_output(&format!("{}\n{}", stdout, stderr));
 
                             if out.status.success() {
                                 state.status = BuildStatus::Complete;
-                                // Look for artifact
-                                let artifact = app_path_clone
-                                    .join("build/zephyr/zephyr.elf");
+                                ZephyrBuildToolHandler::symlink_compile_commands(&app_path_clone, &build_dir_clone);
+                                // Look for artifact in per-board build dir
+                                let artifact = build_dir_clone
+                                    .join("zephyr/zephyr.elf");
                                 if artifact.exists() {
                                     state.artifact_path = Some(artifact.to_string_lossy().to_string());
                                 }
@@ -546,10 +620,11 @@ impl ZephyrBuildToolHandler {
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined_output = format!("{}\n{}", stdout, stderr);
+        let combined_output = truncate_output(&format!("{}\n{}", stdout, stderr));
 
         let artifact_path = if output.status.success() {
-            let artifact = app_path.join("build/zephyr/zephyr.elf");
+            Self::symlink_compile_commands(&app_path, &build_dir);
+            let artifact = build_dir.join("zephyr/zephyr.elf");
             if artifact.exists() {
                 Some(artifact.to_string_lossy().to_string())
             } else {
@@ -624,7 +699,7 @@ impl ZephyrBuildToolHandler {
 
         for app_name in &app_names {
             let app_path = apps_dir.join(app_name);
-            let build_dir = app_path.join("build");
+            let build_dir = Self::build_dir_for_board(&app_path, &args.board);
 
             let mut cmd_args = vec![
                 "build".to_string(),
@@ -653,7 +728,7 @@ impl ZephyrBuildToolHandler {
             match output {
                 Ok(out) => {
                     if out.status.success() {
-                        let artifact = app_path.join("build/zephyr/zephyr.elf");
+                        let artifact = build_dir.join("zephyr/zephyr.elf");
                         let artifact_path = if artifact.exists() {
                             Some(artifact.to_string_lossy().to_string())
                         } else {
@@ -674,7 +749,7 @@ impl ZephyrBuildToolHandler {
                             app: app_name.clone(),
                             success: false,
                             artifact_path: None,
-                            error: Some(stderr.to_string()),
+                            error: Some(truncate_output(&stderr)),
                             duration_ms,
                         });
                     }
@@ -712,19 +787,24 @@ impl ZephyrBuildToolHandler {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Clean build artifacts for a Zephyr application")]
+    #[tool(description = "Clean build artifacts for a Zephyr application. If board is specified, only that board's build is removed. Otherwise all board builds are removed.")]
     async fn clean(&self, Parameters(args): Parameters<CleanArgs>) -> Result<CallToolResult, McpError> {
         debug!("Cleaning build for app '{}'", args.app);
 
         let workspace = self.find_workspace(args.workspace_path.as_deref())?;
         let app_path = self.find_app_path(&workspace, &args.app)?;
-        let build_dir = app_path.join("build");
 
-        let result = if build_dir.exists() {
-            match std::fs::remove_dir_all(&build_dir) {
+        let (target_dir, label) = if let Some(board) = &args.board {
+            (Self::build_dir_for_board(&app_path, board), format!("board '{}'", board))
+        } else {
+            (app_path.join("build"), "all boards".to_string())
+        };
+
+        let result = if target_dir.exists() {
+            match std::fs::remove_dir_all(&target_dir) {
                 Ok(_) => CleanResult {
                     success: true,
-                    message: format!("Removed build directory: {}", build_dir.display()),
+                    message: format!("Removed build artifacts for {}: {}", label, target_dir.display()),
                 },
                 Err(e) => CleanResult {
                     success: false,
@@ -734,7 +814,7 @@ impl ZephyrBuildToolHandler {
         } else {
             CleanResult {
                 success: true,
-                message: format!("Build directory does not exist: {}", build_dir.display()),
+                message: format!("No build artifacts for {}: {}", label, target_dir.display()),
             }
         };
 
@@ -1044,7 +1124,7 @@ impl ZephyrBuildToolHandler {
                         Ok(out) => {
                             let stdout = String::from_utf8_lossy(&out.stdout);
                             let stderr = String::from_utf8_lossy(&out.stderr);
-                            state.output = format!("{}\n{}", stdout, stderr);
+                            state.output = truncate_output(&format!("{}\n{}", stdout, stderr));
                             // twister returns non-zero on test failures, which is not an execution error
                             state.status = TestRunStatus::Complete;
                         }
@@ -1087,7 +1167,7 @@ impl ZephyrBuildToolHandler {
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined_output = format!("{}\n{}", stdout, stderr);
+        let combined_output = truncate_output(&format!("{}\n{}", stdout, stderr));
 
         // Parse results from twister.json
         let summary = parse_twister_json(&output_dir)
@@ -1330,6 +1410,44 @@ mod tests {
         serde_json::from_str(text).expect("expected valid JSON")
     }
 
+    #[test]
+    fn test_truncate_output_short() {
+        let output = "line 1\nline 2\nline 3\n";
+        assert_eq!(truncate_output(output), output);
+    }
+
+    #[test]
+    fn test_truncate_output_long() {
+        // Generate output that exceeds MAX_OUTPUT_BYTES with enough lines
+        let lines: Vec<String> = (0..500)
+            .map(|i| format!("line {:04}: {}", i, "x".repeat(50)))
+            .collect();
+        let output = lines.join("\n");
+        assert!(output.len() > MAX_OUTPUT_BYTES);
+
+        let truncated = truncate_output(&output);
+
+        // Should be smaller
+        assert!(truncated.len() < output.len());
+        // Should contain head and tail
+        assert!(truncated.contains("line 0000"));
+        assert!(truncated.contains(&format!("line {:04}", HEAD_LINES - 1)));
+        assert!(truncated.contains(&format!("line {:04}", 499)));
+        // Should have truncation marker
+        assert!(truncated.contains("lines truncated"));
+        // Middle should be gone
+        assert!(!truncated.contains(&format!("line {:04}", 200)));
+    }
+
+    #[test]
+    fn test_truncate_output_under_byte_limit() {
+        // Many short lines under byte limit — should not truncate
+        let lines: Vec<String> = (0..200).map(|i| format!("L{}", i)).collect();
+        let output = lines.join("\n");
+        assert!(output.len() < MAX_OUTPUT_BYTES);
+        assert_eq!(truncate_output(&output), output);
+    }
+
     #[tokio::test]
     async fn test_list_boards_common() {
         let handler = ZephyrBuildToolHandler::default();
@@ -1473,6 +1591,7 @@ mod tests {
         let result = handler
             .clean(Parameters(CleanArgs {
                 app: "nonexistent_app".to_string(),
+                board: None,
                 workspace_path: Some("/tmp/nonexistent_workspace_xyz".to_string()),
             }))
             .await;
@@ -1534,6 +1653,7 @@ mod tests {
         let result = handler
             .clean(Parameters(CleanArgs {
                 app: "my_app".to_string(),
+                board: None,
                 workspace_path: None,
             }))
             .await
@@ -1541,6 +1661,128 @@ mod tests {
 
         let parsed = extract_json(&result);
         assert!(parsed["success"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn test_build_dir_for_board() {
+        let app = PathBuf::from("/workspace/apps/my_app");
+        let dir = ZephyrBuildToolHandler::build_dir_for_board(&app, "nrf52840dk/nrf52840");
+        assert_eq!(dir, PathBuf::from("/workspace/apps/my_app/build/nrf52840dk_nrf52840"));
+    }
+
+    #[test]
+    fn test_build_dir_for_board_with_multiple_slashes() {
+        let app = PathBuf::from("/workspace/apps/my_app");
+        let dir = ZephyrBuildToolHandler::build_dir_for_board(&app, "nrf54l15dk/nrf54l15/cpuapp");
+        assert_eq!(dir, PathBuf::from("/workspace/apps/my_app/build/nrf54l15dk_nrf54l15_cpuapp"));
+    }
+
+    #[test]
+    fn test_build_dir_for_board_simple() {
+        let app = PathBuf::from("/workspace/apps/my_app");
+        let dir = ZephyrBuildToolHandler::build_dir_for_board(&app, "qemu_cortex_m3");
+        assert_eq!(dir, PathBuf::from("/workspace/apps/my_app/build/qemu_cortex_m3"));
+    }
+
+    #[tokio::test]
+    async fn test_list_apps_with_per_board_builds() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let app = apps_dir.join("my_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(my_app)\n").unwrap();
+
+        // Create per-board build dirs with a zephyr/ subdir (artifact marker)
+        fs::create_dir_all(app.join("build/nrf52840dk_nrf52840/zephyr")).unwrap();
+        fs::create_dir_all(app.join("build/qemu_cortex_m3/zephyr")).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_apps(Parameters(ListAppsArgs { workspace_path: None }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let apps = parsed["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert!(apps[0]["has_build"].as_bool().unwrap());
+        let built: Vec<&str> = apps[0]["built_boards"].as_array().unwrap()
+            .iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(built.contains(&"nrf52840dk_nrf52840"));
+        assert!(built.contains(&"qemu_cortex_m3"));
+    }
+
+    #[tokio::test]
+    async fn test_clean_specific_board() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let app = apps_dir.join("my_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(my_app)\n").unwrap();
+
+        // Create two board builds
+        fs::create_dir_all(app.join("build/nrf52840dk_nrf52840/zephyr")).unwrap();
+        fs::create_dir_all(app.join("build/qemu_cortex_m3/zephyr")).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // Clean only one board
+        let result = handler
+            .clean(Parameters(CleanArgs {
+                app: "my_app".to_string(),
+                board: Some("nrf52840dk/nrf52840".to_string()),
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        // nrf board dir should be gone, qemu should remain
+        assert!(!app.join("build/nrf52840dk_nrf52840").exists());
+        assert!(app.join("build/qemu_cortex_m3").exists());
+    }
+
+    #[tokio::test]
+    async fn test_clean_all_boards() {
+        let tmp = TempDir::new().unwrap();
+        let apps_dir = tmp.path().join("zephyr-apps/apps");
+        let app = apps_dir.join("my_app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("CMakeLists.txt"), "project(my_app)\n").unwrap();
+
+        // Create two board builds
+        fs::create_dir_all(app.join("build/nrf52840dk_nrf52840/zephyr")).unwrap();
+        fs::create_dir_all(app.join("build/qemu_cortex_m3/zephyr")).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // Clean all boards (board = None)
+        let result = handler
+            .clean(Parameters(CleanArgs {
+                app: "my_app".to_string(),
+                board: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        // Entire build dir should be gone
+        assert!(!app.join("build").exists());
     }
 
     // =========================================================================

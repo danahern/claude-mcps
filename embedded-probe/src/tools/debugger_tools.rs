@@ -2031,6 +2031,155 @@ except Exception as e:
     }
 
     // =============================================================================
+    // nrfutil Vendor Tools
+    // =============================================================================
+
+    #[tool(description = "Program Nordic device via nrfutil. Auto-detects chip family. Supports nRF5340 dual-core (Application/Network). No probe-rs session needed.")]
+    async fn nrfutil_program(&self, Parameters(args): Parameters<NrfutilProgramArgs>) -> Result<CallToolResult, McpError> {
+        info!("nrfutil_program: file={}", args.file_path);
+
+        let mut cmd = tokio::process::Command::new("nrfutil");
+        cmd.args(["device", "program"]);
+        cmd.args(["--firmware", &args.file_path]);
+
+        if let Some(core) = &args.core {
+            cmd.args(["--core", core]);
+        }
+
+        if let Some(snr) = &args.snr {
+            cmd.args(["--serial-number", snr]);
+        }
+
+        if args.verify {
+            cmd.arg("--verify");
+        }
+
+        let start_time = std::time::Instant::now();
+
+        match cmd.output().await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let elapsed = start_time.elapsed();
+
+                if !output.status.success() {
+                    return Err(McpError::internal_error(
+                        format!("nrfutil program failed:\n{}\n{}", stderr, stdout), None
+                    ));
+                }
+
+                // Optional reset after programming
+                if args.reset_after {
+                    let mut reset_cmd = tokio::process::Command::new("nrfutil");
+                    reset_cmd.args(["device", "reset"]);
+                    if let Some(snr) = &args.snr {
+                        reset_cmd.args(["--serial-number", snr]);
+                    }
+                    if let Err(e) = reset_cmd.output().await {
+                        warn!("nrfutil reset after program failed: {}", e);
+                    }
+                }
+
+                let message = format!(
+                    "nrfutil program completed\n\n\
+                    File: {}\n\
+                    Core: {}\n\
+                    Verify: {}\n\
+                    Reset: {}\n\
+                    Duration: {:.1}s\n\n\
+                    Output:\n{}",
+                    args.file_path,
+                    args.core.as_deref().unwrap_or("auto"),
+                    args.verify, args.reset_after,
+                    elapsed.as_secs_f64(),
+                    stdout
+                );
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            }
+            Err(e) => {
+                Err(McpError::internal_error(
+                    format!("Failed to run nrfutil: {}\n\nMake sure nrfutil is installed: https://www.nordicsemi.com/Products/Development-tools/nRF-Util", e),
+                    None
+                ))
+            }
+        }
+    }
+
+    #[tool(description = "Recover a Nordic device by clearing APPROTECT. Use when device is locked or unresponsive.")]
+    async fn nrfutil_recover(&self, Parameters(args): Parameters<NrfutilRecoverArgs>) -> Result<CallToolResult, McpError> {
+        info!("nrfutil_recover");
+
+        let mut cmd = tokio::process::Command::new("nrfutil");
+        cmd.args(["device", "recover"]);
+
+        if let Some(snr) = &args.snr {
+            cmd.args(["--serial-number", snr]);
+        }
+
+        let start_time = std::time::Instant::now();
+
+        match cmd.output().await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let elapsed = start_time.elapsed();
+
+                if !output.status.success() {
+                    return Err(McpError::internal_error(
+                        format!("nrfutil recover failed:\n{}\n{}", stderr, stdout), None
+                    ));
+                }
+
+                let message = format!(
+                    "nrfutil recover completed\n\nDuration: {:.1}s\n\nOutput:\n{}",
+                    elapsed.as_secs_f64(), stdout
+                );
+                Ok(CallToolResult::success(vec![Content::text(message)]))
+            }
+            Err(e) => {
+                Err(McpError::internal_error(
+                    format!("Failed to run nrfutil: {}\n\nMake sure nrfutil is installed", e),
+                    None
+                ))
+            }
+        }
+    }
+
+    #[tool(description = "Reset a Nordic device via nrfutil")]
+    async fn nrfutil_reset(&self, Parameters(args): Parameters<NrfutilResetArgs>) -> Result<CallToolResult, McpError> {
+        info!("nrfutil_reset");
+
+        let mut cmd = tokio::process::Command::new("nrfutil");
+        cmd.args(["device", "reset"]);
+
+        if let Some(snr) = &args.snr {
+            cmd.args(["--serial-number", snr]);
+        }
+
+        match cmd.output().await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if !output.status.success() {
+                    return Err(McpError::internal_error(
+                        format!("nrfutil reset failed:\n{}\n{}", stderr, stdout), None
+                    ));
+                }
+
+                Ok(CallToolResult::success(vec![Content::text(
+                    format!("nrfutil reset completed\n\nOutput:\n{}", stdout)
+                )]))
+            }
+            Err(e) => {
+                Err(McpError::internal_error(
+                    format!("Failed to run nrfutil: {}", e), None
+                ))
+            }
+        }
+    }
+
+    // =============================================================================
     // Custom Target Support
     // =============================================================================
 
@@ -2986,7 +3135,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, Zephyr coredump analysis, GDB server, RTT communication, and flash programming with real hardware integration. All 36 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, analyze_coredump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, load_custom_target.".to_string()),
+            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, Zephyr coredump analysis, GDB server, RTT communication, and flash programming with real hardware integration. All 39 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, analyze_coredump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, nrfutil_program, nrfutil_recover, nrfutil_reset, load_custom_target.".to_string()),
         }
     }
 
@@ -2995,7 +3144,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Complete Embedded Debugger MCP server initialized with all 36 tools");
+        info!("Complete Embedded Debugger MCP server initialized with all 39 tools");
         Ok(self.get_info())
     }
 }

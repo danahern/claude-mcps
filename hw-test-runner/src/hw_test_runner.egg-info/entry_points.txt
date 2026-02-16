@@ -1,0 +1,2 @@
+[console_scripts]
+hw-test-runner = hw_test_runner.__main__:main

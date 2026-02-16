@@ -472,6 +472,38 @@ pub struct NrfjprogFlashArgs {
 }
 
 // =============================================================================
+// nrfutil Vendor Tool Types
+// =============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NrfutilProgramArgs {
+    /// Path to firmware file (hex or bin)
+    pub file_path: String,
+    /// Core to program: "Application" or "Network" (for nRF5340 dual-core). Auto-detected if omitted.
+    pub core: Option<String>,
+    /// Device serial number for multi-device setups (optional)
+    pub snr: Option<String>,
+    /// Whether to verify after programming
+    #[serde(default = "default_true")]
+    pub verify: bool,
+    /// Whether to reset after programming
+    #[serde(default = "default_true")]
+    pub reset_after: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NrfutilRecoverArgs {
+    /// Device serial number for multi-device setups (optional)
+    pub snr: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NrfutilResetArgs {
+    /// Device serial number for multi-device setups (optional)
+    pub snr: Option<String>,
+}
+
+// =============================================================================
 // Custom Target Types
 // =============================================================================
 

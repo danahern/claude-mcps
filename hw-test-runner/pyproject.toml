@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hw-test-runner"
+version = "0.1.0"
+description = "Hardware test runner MCP server — BLE and TCP testing for embedded devices"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "bleak>=0.21",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+hw-test-runner = "hw_test_runner.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
