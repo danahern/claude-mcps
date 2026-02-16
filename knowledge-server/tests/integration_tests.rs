@@ -3,6 +3,7 @@ use knowledge_server::db::KnowledgeDb;
 use std::path::Path;
 
 #[test]
+#[ignore] // Requires workspace root knowledge/boards/ directory
 fn test_load_board_profiles() {
     let boards_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap()
@@ -37,6 +38,7 @@ fn test_load_board_profiles() {
 }
 
 #[test]
+#[ignore] // Requires workspace root knowledge/items/ directory
 fn test_load_knowledge_items() {
     let items_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap()
@@ -300,6 +302,7 @@ fn test_db_rebuild() {
 }
 
 #[test]
+#[ignore] // Requires workspace root knowledge/boards/ directory
 fn test_board_hierarchy() {
     let boards_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent().unwrap().parent().unwrap()
