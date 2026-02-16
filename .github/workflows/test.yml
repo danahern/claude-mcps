@@ -1,4 +1,5 @@
 name: Test
+# Runs on push to main and PRs targeting main
 
 on:
   push:
