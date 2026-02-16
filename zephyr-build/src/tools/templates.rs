@@ -78,30 +78,41 @@ pub fn merge_addon_code(addons: &[AddonManifest], app_name: &str) -> AddonCodeSe
 
     for addon in addons {
         if let Some(k) = &addon.kconfig {
-            let rendered = render(k.trim_end(), &[("APP_NAME", app_name)]);
-            kconfig_parts.push(rendered);
+            let trimmed = k.trim_end();
+            if !trimmed.is_empty() {
+                let rendered = render(trimmed, &[("APP_NAME", app_name)]);
+                kconfig_parts.push(rendered);
+            }
         }
         if let Some(i) = &addon.includes {
-            include_parts.push(i.trim_end().to_string());
+            let trimmed = i.trim_end();
+            if !trimmed.is_empty() {
+                include_parts.push(trimmed.to_string());
+            }
         }
         if let Some(g) = &addon.globals {
-            global_parts.push(g.trim_end().to_string());
+            let trimmed = g.trim_end();
+            if !trimmed.is_empty() {
+                global_parts.push(trimmed.to_string());
+            }
         }
         if let Some(init) = &addon.init {
-            // Indent each non-empty line with a tab
-            let indented: String = init
-                .trim_end()
-                .lines()
-                .map(|line| {
-                    if line.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!("\t{}", line)
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            init_parts.push(indented);
+            let trimmed = init.trim_end();
+            if !trimmed.is_empty() {
+                // Indent each non-empty line with a tab
+                let indented: String = trimmed
+                    .lines()
+                    .map(|line| {
+                        if line.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("\t{}", line)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                init_parts.push(indented);
+            }
         }
     }
 
@@ -311,6 +322,111 @@ mod tests {
         assert!(sections.init.contains("\tif (err) {"));
         assert!(sections.init.contains("\t\tLOG_ERR(\"failed\");")); // original \t + our \t
         assert!(sections.init.contains("\t}"));
+    }
+
+    #[test]
+    fn test_merge_addon_empty_string_kconfig() {
+        // YAML `kconfig: ""` becomes Some("") — should produce empty output
+        let addon = AddonManifest {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            depends: vec![],
+            kconfig: Some("".to_string()),
+            includes: None,
+            globals: None,
+            init: None,
+        };
+        let sections = merge_addon_code(&[addon], "app");
+        assert_eq!(sections.kconfig, "");
+    }
+
+    #[test]
+    fn test_merge_addon_empty_string_all_fields() {
+        // All fields are Some("") — should produce same as no addons
+        let addon = AddonManifest {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            depends: vec![],
+            kconfig: Some("".to_string()),
+            includes: Some("".to_string()),
+            globals: Some("".to_string()),
+            init: Some("".to_string()),
+        };
+        let sections = merge_addon_code(&[addon], "app");
+        assert_eq!(sections.kconfig, "");
+        assert_eq!(sections.includes, "");
+        assert_eq!(sections.globals, "");
+        assert_eq!(sections.init, "");
+        assert_eq!(sections.err_decl, ""); // no real init → no err_decl
+    }
+
+    #[test]
+    fn test_merge_addon_whitespace_only_init() {
+        // init: "  \n  \n" — should be treated as empty
+        let addon = AddonManifest {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            depends: vec![],
+            kconfig: None,
+            includes: None,
+            globals: None,
+            init: Some("  \n  \n".to_string()),
+        };
+        let sections = merge_addon_code(&[addon], "app");
+        assert_eq!(sections.init, "");
+        assert_eq!(sections.err_decl, "");
+    }
+
+    #[test]
+    fn test_merge_addon_kconfig_only() {
+        // Addon with only kconfig, no init — err_decl should be empty
+        let addon = AddonManifest {
+            name: "config_only".to_string(),
+            description: "config only".to_string(),
+            depends: vec![],
+            kconfig: Some("CONFIG_FOO=y\nCONFIG_BAR=42".to_string()),
+            includes: None,
+            globals: None,
+            init: None,
+        };
+        let sections = merge_addon_code(&[addon], "app");
+        assert!(sections.kconfig.contains("CONFIG_FOO=y"));
+        assert!(sections.kconfig.contains("CONFIG_BAR=42"));
+        assert_eq!(sections.includes, "");
+        assert_eq!(sections.globals, "");
+        assert_eq!(sections.init, "");
+        assert_eq!(sections.err_decl, "");
+    }
+
+    #[test]
+    fn test_full_template_structural_ordering() {
+        // Verify includes appear before globals, globals before main()
+        let addon = AddonManifest {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            depends: vec![],
+            kconfig: None,
+            includes: Some("#include <test.h>".to_string()),
+            globals: Some("static int counter;".to_string()),
+            init: Some("err = test_init();".to_string()),
+        };
+        let sections = merge_addon_code(&[addon], "my_app");
+        let main_c = render(TEMPLATE_MAIN_C, &[
+            ("APP_NAME", "my_app"),
+            ("ADDON_INCLUDES", &sections.includes),
+            ("ADDON_GLOBALS", &sections.globals),
+            ("ERR_DECL", &sections.err_decl),
+            ("ADDON_INIT", &sections.init),
+        ]);
+
+        let include_pos = main_c.find("#include <test.h>").unwrap();
+        let global_pos = main_c.find("static int counter;").unwrap();
+        let main_pos = main_c.find("int main(void)").unwrap();
+        let init_pos = main_c.find("err = test_init()").unwrap();
+
+        assert!(include_pos < global_pos, "includes must come before globals");
+        assert!(global_pos < main_pos, "globals must come before main()");
+        assert!(main_pos < init_pos, "init must come after main()");
     }
 
     #[test]

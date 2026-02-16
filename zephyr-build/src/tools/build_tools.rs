@@ -1000,6 +1000,21 @@ impl ZephyrBuildToolHandler {
             ));
         }
 
+        // Check addon dependencies
+        for addon in &resolved_addons {
+            for dep in &addon.depends {
+                if !resolved_lib_names.contains(dep) {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "Addon '{}' depends on '{}' which is not included in libraries",
+                            addon.name, dep
+                        ),
+                        None,
+                    ));
+                }
+            }
+        }
+
         let overlay_block = overlay_lines.join("\n");
 
         // Merge addon code sections
@@ -2875,6 +2890,275 @@ init: |
         let addon_names: Vec<&str> = addons.iter().map(|a| a["name"].as_str().unwrap()).collect();
         assert!(addon_names.contains(&"ble"));
         assert!(addon_names.contains(&"wifi"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_addon_dependency_missing() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        // Add a tcp addon that depends on wifi
+        let addons_dir = tmp.path().join("zephyr-apps/addons");
+        fs::write(addons_dir.join("tcp.yml"), r#"
+name: tcp
+description: "TCP client"
+depends: ["wifi"]
+kconfig: |
+  CONFIG_NET_SOCKETS=y
+init: |
+  LOG_INF("TCP ready");
+"#).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // Request tcp WITHOUT wifi — should fail
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "tcp_only".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["tcp".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("tcp"));
+        assert!(err_msg.contains("wifi"));
+        assert!(err_msg.contains("depends on"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_addon_dependency_satisfied() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        // Add a tcp addon that depends on wifi
+        let addons_dir = tmp.path().join("zephyr-apps/addons");
+        fs::write(addons_dir.join("tcp.yml"), r#"
+name: tcp
+description: "TCP client"
+depends: ["wifi"]
+kconfig: |
+  CONFIG_NET_SOCKETS=y
+init: |
+  LOG_INF("TCP ready");
+"#).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // Request tcp WITH wifi — should succeed
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "tcp_wifi".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["wifi".to_string(), "tcp".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_ok());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/tcp_wifi");
+        let prj_conf = fs::read_to_string(app_dir.join("prj.conf")).unwrap();
+        assert!(prj_conf.contains("CONFIG_WIFI=y"));
+        assert!(prj_conf.contains("CONFIG_NET_SOCKETS=y"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_mixed_library_and_addon() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // crash_log is a library, ble is an addon — both in same call
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "mixed_app".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["ble".to_string()]), // crash_log/device_shell are defaults
+                description: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/mixed_app");
+
+        // Library overlay in CMakeLists.txt
+        let cmake = fs::read_to_string(app_dir.join("CMakeLists.txt")).unwrap();
+        assert!(cmake.contains("crash_log/conf/debug_base.conf"));
+
+        // Addon code in main.c
+        let main_c = fs::read_to_string(app_dir.join("src/main.c")).unwrap();
+        assert!(main_c.contains("#include <zephyr/bluetooth/bluetooth.h>"));
+        assert!(main_c.contains("err = bt_enable(NULL);"));
+    }
+
+    #[tokio::test]
+    async fn test_list_templates_addons_sorted() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_templates(Parameters(ListTemplatesArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let addons = parsed["addons"].as_array().unwrap();
+        let names: Vec<&str> = addons.iter().map(|a| a["name"].as_str().unwrap()).collect();
+
+        // Should be alphabetically sorted
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(names, sorted_names);
+    }
+
+    #[tokio::test]
+    async fn test_list_templates_ignores_non_yml_files() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        // Add a non-yml file in addons dir
+        let addons_dir = tmp.path().join("zephyr-apps/addons");
+        fs::write(addons_dir.join("README.md"), "# Addons\n").unwrap();
+        fs::write(addons_dir.join("notes.txt"), "some notes").unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_templates(Parameters(ListTemplatesArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let addons = parsed["addons"].as_array().unwrap();
+        let names: Vec<&str> = addons.iter().map(|a| a["name"].as_str().unwrap()).collect();
+
+        // Only yml files should be listed
+        assert!(names.contains(&"ble"));
+        assert!(names.contains(&"wifi"));
+        assert!(!names.iter().any(|n| *n == "README" || *n == "notes"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_addon_with_empty_string_fields() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_libs(&tmp);
+
+        let addons_dir = tmp.path().join("zephyr-apps/addons");
+        fs::create_dir_all(&addons_dir).unwrap();
+
+        // Addon with empty strings (not None) for some fields
+        fs::write(addons_dir.join("minimal.yml"), r#"
+name: minimal
+description: "Minimal addon"
+depends: []
+kconfig: |
+  CONFIG_MINIMAL=y
+includes: ""
+globals: ""
+init: ""
+"#).unwrap();
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "min_app".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["minimal".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/min_app");
+        let main_c = fs::read_to_string(app_dir.join("src/main.c")).unwrap();
+
+        // No int err; since init is empty
+        assert!(!main_c.contains("int err;"));
+
+        let prj_conf = fs::read_to_string(app_dir.join("prj.conf")).unwrap();
+        assert!(prj_conf.contains("CONFIG_MINIMAL=y"));
+    }
+
+    #[test]
+    fn test_addon_yaml_deserialization() {
+        // Test that real addon YAML parses correctly
+        let yaml = r#"
+name: test_addon
+description: "Test addon"
+depends:
+  - wifi
+kconfig: |
+  CONFIG_X=y
+includes: |
+  #include <test.h>
+globals: |
+  static int x;
+init: |
+  err = init();
+"#;
+        let manifest: super::super::types::AddonManifest =
+            serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(manifest.name, "test_addon");
+        assert_eq!(manifest.description, "Test addon");
+        assert_eq!(manifest.depends, vec!["wifi"]);
+        assert!(manifest.kconfig.as_ref().unwrap().contains("CONFIG_X=y"));
+        assert!(manifest.includes.as_ref().unwrap().contains("#include <test.h>"));
+        assert!(manifest.globals.as_ref().unwrap().contains("static int x;"));
+        assert!(manifest.init.as_ref().unwrap().contains("err = init();"));
+    }
+
+    #[test]
+    fn test_addon_yaml_minimal_deserialization() {
+        // Addon with only required fields
+        let yaml = r#"
+name: bare
+description: "Bare addon"
+"#;
+        let manifest: super::super::types::AddonManifest =
+            serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(manifest.name, "bare");
+        assert!(manifest.depends.is_empty());
+        assert!(manifest.kconfig.is_none());
+        assert!(manifest.includes.is_none());
+        assert!(manifest.globals.is_none());
+        assert!(manifest.init.is_none());
     }
 
     #[tokio::test]
