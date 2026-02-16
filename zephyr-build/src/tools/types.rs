@@ -333,6 +333,8 @@ pub struct ListTemplatesArgs {}
 #[derive(Debug, Serialize)]
 pub struct ListTemplatesResult {
     pub templates: Vec<TemplateInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub addons: Vec<AddonInfo>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -408,4 +410,29 @@ pub struct AppManifest {
     pub libraries: Vec<String>,
     #[serde(default)]
     pub template: Option<String>,
+}
+
+/// Addon manifest (addons/<name>.yml) — code generation module
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddonManifest {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub depends: Vec<String>,
+    #[serde(default)]
+    pub kconfig: Option<String>,
+    #[serde(default)]
+    pub includes: Option<String>,
+    #[serde(default)]
+    pub globals: Option<String>,
+    #[serde(default)]
+    pub init: Option<String>,
+}
+
+/// Addon info returned by list_templates
+#[derive(Debug, Serialize, Clone)]
+pub struct AddonInfo {
+    pub name: String,
+    pub description: String,
+    pub depends: Vec<String>,
 }

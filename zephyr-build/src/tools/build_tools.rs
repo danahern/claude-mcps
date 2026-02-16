@@ -287,6 +287,55 @@ impl ZephyrBuildToolHandler {
         apps_dir.parent().unwrap_or(&apps_dir).join("lib")
     }
 
+    /// Get addons directory path (sibling of apps dir)
+    fn get_addons_dir(&self, workspace: &Path) -> PathBuf {
+        let apps_dir = self.get_apps_dir(workspace);
+        apps_dir.parent().unwrap_or(&apps_dir).join("addons")
+    }
+
+    /// Read an addon manifest from addons/<name>.yml
+    fn read_addon_manifest(&self, workspace: &Path, addon_name: &str) -> Result<AddonManifest, McpError> {
+        let manifest_path = self.get_addons_dir(workspace).join(format!("{}.yml", addon_name));
+        let content = std::fs::read_to_string(&manifest_path).map_err(|e| {
+            McpError::invalid_params(
+                format!("Cannot read addon manifest {}: {}", manifest_path.display(), e),
+                None,
+            )
+        })?;
+        serde_yaml::from_str(&content).map_err(|e| {
+            McpError::internal_error(
+                format!("Invalid addon manifest {}: {}", manifest_path.display(), e),
+                None,
+            )
+        })
+    }
+
+    /// List all available addons by scanning addons/*.yml
+    fn list_available_addons(&self, workspace: &Path) -> Vec<AddonInfo> {
+        let addons_dir = self.get_addons_dir(workspace);
+        let mut addons = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&addons_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("yml") {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(manifest) = serde_yaml::from_str::<AddonManifest>(&content) {
+                            addons.push(AddonInfo {
+                                name: manifest.name,
+                                description: manifest.description,
+                                depends: manifest.depends,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        addons.sort_by(|a, b| a.name.cmp(&b.name));
+        addons
+    }
+
     /// Read a library manifest from lib/<name>/manifest.yml
     fn read_library_manifest(&self, workspace: &Path, lib_name: &str) -> Result<LibraryManifest, McpError> {
         let manifest_path = self.get_lib_dir(workspace).join(lib_name).join("manifest.yml");
@@ -826,8 +875,14 @@ impl ZephyrBuildToolHandler {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "List available app templates. Call this before create_app to see what templates exist and what they include.")]
+    #[tool(description = "List available app templates and composable addons. Call this before create_app to see what templates and addons exist.")]
     async fn list_templates(&self, Parameters(_args): Parameters<ListTemplatesArgs>) -> Result<CallToolResult, McpError> {
+        // Scan for addons — best-effort (may not have a workspace)
+        let addons = match self.find_workspace(None) {
+            Ok(workspace) => self.list_available_addons(&workspace),
+            Err(_) => Vec::new(),
+        };
+
         let result = ListTemplatesResult {
             templates: vec![
                 TemplateInfo {
@@ -844,6 +899,7 @@ impl ZephyrBuildToolHandler {
                     ],
                 },
             ],
+            addons,
         };
 
         let json = serde_json::to_string_pretty(&result).map_err(|e| {
@@ -894,10 +950,14 @@ impl ZephyrBuildToolHandler {
             }
         }
 
-        // Read library manifests to build OVERLAY_CONFIG lines
+        // Resolve each name: library (overlay injection) or addon (code generation)
         let lib_dir = self.get_lib_dir(&workspace);
         let mut overlay_lines = Vec::new();
+        let mut resolved_addons = Vec::new();
+        let mut resolved_lib_names = Vec::new();
+
         for lib_name in &all_libs {
+            // 1. Check lib/<name>/manifest.yml → library
             match self.read_library_manifest(&workspace, lib_name) {
                 Ok(manifest) => {
                     for overlay in &manifest.default_overlays {
@@ -906,21 +966,44 @@ impl ZephyrBuildToolHandler {
                             lib_name, overlay
                         ));
                     }
+                    resolved_lib_names.push(lib_name.clone());
+                    continue;
                 }
                 Err(_) => {
-                    // Library exists but no manifest — check if the lib dir exists at all
-                    if !lib_dir.join(lib_name).exists() {
-                        return Err(McpError::invalid_params(
-                            format!("Library '{}' not found in {}", lib_name, lib_dir.display()),
-                            None,
-                        ));
+                    // Check if lib dir exists without manifest
+                    if lib_dir.join(lib_name).exists() {
+                        resolved_lib_names.push(lib_name.clone());
+                        continue;
                     }
-                    // No manifest, skip overlay generation for this lib
                 }
             }
+
+            // 2. Check addons/<name>.yml → addon
+            match self.read_addon_manifest(&workspace, lib_name) {
+                Ok(manifest) => {
+                    resolved_lib_names.push(lib_name.clone());
+                    resolved_addons.push(manifest);
+                    continue;
+                }
+                Err(_) => {}
+            }
+
+            // 3. Neither found — error
+            return Err(McpError::invalid_params(
+                format!(
+                    "'{}' not found. Checked lib/{}/manifest.yml and addons/{}.yml",
+                    lib_name,
+                    lib_name,
+                    lib_name
+                ),
+                None,
+            ));
         }
 
         let overlay_block = overlay_lines.join("\n");
+
+        // Merge addon code sections
+        let addon_code = templates::merge_addon_code(&resolved_addons, &args.name);
 
         let description = args.description.as_deref().unwrap_or(&args.name);
         let board = args.board.as_deref().unwrap_or("nrf52840dk/nrf52840");
@@ -931,8 +1014,16 @@ impl ZephyrBuildToolHandler {
             ("OVERLAY_LINES", &overlay_block),
         ]);
 
+        let prj_conf_content = templates::render(templates::TEMPLATE_PRJ_CONF, &[
+            ("ADDON_KCONFIG", &addon_code.kconfig),
+        ]);
+
         let main_c_content = templates::render(templates::TEMPLATE_MAIN_C, &[
             ("APP_NAME", &args.name),
+            ("ADDON_INCLUDES", &addon_code.includes),
+            ("ADDON_GLOBALS", &addon_code.globals),
+            ("ERR_DECL", &addon_code.err_decl),
+            ("ADDON_INIT", &addon_code.init),
         ]);
 
         // Build manifest YAML lines
@@ -957,7 +1048,7 @@ impl ZephyrBuildToolHandler {
 
         let files = vec![
             ("CMakeLists.txt", cmake_content),
-            ("prj.conf", templates::TEMPLATE_PRJ_CONF.to_string()),
+            ("prj.conf", prj_conf_content),
             ("manifest.yml", manifest_content),
             ("src/main.c", main_c_content),
         ];
@@ -2553,6 +2644,263 @@ depends: []
             }))
             .await;
         assert!(result.is_err());
+        // Error should mention both lib/ and addons/ paths
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("nonexistent_lib"));
+    }
+
+    // =========================================================================
+    // addon tests
+    // =========================================================================
+
+    /// Create a workspace with lib manifests AND addon files for addon tests
+    fn setup_workspace_with_addons(tmp: &TempDir) {
+        setup_workspace_with_libs(tmp);
+
+        let addons_dir = tmp.path().join("zephyr-apps/addons");
+        fs::create_dir_all(&addons_dir).unwrap();
+
+        fs::write(addons_dir.join("ble.yml"), r#"
+name: ble
+description: "BLE peripheral with NUS"
+depends: []
+kconfig: |
+  # Bluetooth
+  CONFIG_BT=y
+  CONFIG_BT_PERIPHERAL=y
+  CONFIG_BT_DEVICE_NAME="{{APP_NAME}}"
+includes: |
+  #include <zephyr/bluetooth/bluetooth.h>
+  #include <zephyr/bluetooth/conn.h>
+globals: |
+  static struct bt_conn *current_conn;
+init: |
+  err = bt_enable(NULL);
+  if (err) {
+  	LOG_ERR("BT init failed: %d", err);
+  }
+"#).unwrap();
+
+        fs::write(addons_dir.join("wifi.yml"), r#"
+name: wifi
+description: "WiFi station with DHCP"
+depends: []
+kconfig: |
+  CONFIG_WIFI=y
+  CONFIG_NETWORKING=y
+includes: |
+  #include <zephyr/net/wifi_mgmt.h>
+globals: |
+  static bool wifi_connected;
+init: |
+  err = wifi_connect();
+"#).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_app_with_addon() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "test_ble".to_string(),
+                template: None,
+                board: Some("nrf52840dk/nrf52840".to_string()),
+                libraries: Some(vec!["ble".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/test_ble");
+
+        // Verify main.c has BLE boilerplate
+        let main_c = fs::read_to_string(app_dir.join("src/main.c")).unwrap();
+        assert!(main_c.contains("#include <zephyr/bluetooth/bluetooth.h>"));
+        assert!(main_c.contains("#include <zephyr/bluetooth/conn.h>"));
+        assert!(main_c.contains("static struct bt_conn *current_conn;"));
+        assert!(main_c.contains("int err;"));
+        assert!(main_c.contains("err = bt_enable(NULL);"));
+
+        // Verify prj.conf has BT Kconfig
+        let prj_conf = fs::read_to_string(app_dir.join("prj.conf")).unwrap();
+        assert!(prj_conf.contains("CONFIG_BT=y"));
+        assert!(prj_conf.contains("CONFIG_BT_PERIPHERAL=y"));
+        assert!(prj_conf.contains("CONFIG_BT_DEVICE_NAME=\"test_ble\""));
+
+        // Base config still present
+        assert!(prj_conf.contains("CONFIG_LOG=y"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_with_multiple_addons() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "test_combo".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["ble".to_string(), "wifi".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/test_combo");
+        let main_c = fs::read_to_string(app_dir.join("src/main.c")).unwrap();
+
+        // Both addons' code should be present
+        assert!(main_c.contains("#include <zephyr/bluetooth/bluetooth.h>"));
+        assert!(main_c.contains("#include <zephyr/net/wifi_mgmt.h>"));
+        assert!(main_c.contains("static struct bt_conn *current_conn;"));
+        assert!(main_c.contains("static bool wifi_connected;"));
+        assert!(main_c.contains("err = bt_enable(NULL);"));
+        assert!(main_c.contains("err = wifi_connect();"));
+
+        let prj_conf = fs::read_to_string(app_dir.join("prj.conf")).unwrap();
+        assert!(prj_conf.contains("CONFIG_BT=y"));
+        assert!(prj_conf.contains("CONFIG_WIFI=y"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_no_addons_clean() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "plain".to_string(),
+                template: None,
+                board: None,
+                libraries: None,
+                description: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/plain");
+        let main_c = fs::read_to_string(app_dir.join("src/main.c")).unwrap();
+
+        // No unused int err;
+        assert!(!main_c.contains("int err;"));
+        // No addon includes
+        assert!(!main_c.contains("#include <zephyr/bluetooth"));
+
+        let prj_conf = fs::read_to_string(app_dir.join("prj.conf")).unwrap();
+        assert!(!prj_conf.contains("CONFIG_BT=y"));
+        // Should end cleanly
+        assert!(prj_conf.contains("CONFIG_REBOOT=y"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_library_still_works() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        // crash_log is a library, not an addon — should still generate overlay lines
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "lib_test".to_string(),
+                template: None,
+                board: None,
+                libraries: None, // defaults include crash_log, device_shell
+                description: None,
+                workspace_path: None,
+            }))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        assert!(parsed["success"].as_bool().unwrap());
+
+        let app_dir = tmp.path().join("zephyr-apps/apps/lib_test");
+        let cmake = fs::read_to_string(app_dir.join("CMakeLists.txt")).unwrap();
+        assert!(cmake.contains("crash_log/conf/debug_base.conf"));
+    }
+
+    #[tokio::test]
+    async fn test_list_templates_includes_addons() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .list_templates(Parameters(ListTemplatesArgs {}))
+            .await
+            .unwrap();
+
+        let parsed = extract_json(&result);
+        let addons = parsed["addons"].as_array().unwrap();
+        assert!(addons.len() >= 2);
+
+        let addon_names: Vec<&str> = addons.iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert!(addon_names.contains(&"ble"));
+        assert!(addon_names.contains(&"wifi"));
+    }
+
+    #[tokio::test]
+    async fn test_create_app_nonexistent_mentions_both_paths() {
+        let tmp = TempDir::new().unwrap();
+        setup_workspace_with_addons(&tmp);
+
+        let handler = ZephyrBuildToolHandler::new(Config {
+            workspace_path: Some(tmp.path().to_path_buf()),
+            apps_dir: "zephyr-apps/apps".to_string(),
+        });
+
+        let result = handler
+            .create_app(Parameters(CreateAppArgs {
+                name: "my_app".to_string(),
+                template: None,
+                board: None,
+                libraries: Some(vec!["nonexistent".to_string()]),
+                description: None,
+                workspace_path: None,
+            }))
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("lib/nonexistent/manifest.yml"));
+        assert!(err_msg.contains("addons/nonexistent.yml"));
     }
 
     // =========================================================================

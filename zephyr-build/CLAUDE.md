@@ -20,8 +20,8 @@ Set `workspace_path` in config or pass per-call. Points to the directory contain
 - `build` — Build an app for a target board. Supports `pristine=true` for clean builds and `background=true` for async
 - `build_status` — Check progress of a background build
 - `clean` — Remove build artifacts for an app
-- `list_templates` — List available app templates with descriptions, default libraries, and generated files. Call before `create_app`.
-- `create_app` — Create a new app from a template. Args: `name` (required), `template` (default "core"), `board`, `libraries`, `description`. Reads library manifests to generate OVERLAY_CONFIG lines.
+- `list_templates` — List available app templates and composable addons. Returns templates (with default libraries and files) and addons (from `addons/*.yml`). Call before `create_app`.
+- `create_app` — Create a new app from a template. Args: `name` (required), `template` (default "core"), `board`, `libraries`, `description`. The `libraries` parameter resolves each name as either a **library** (`lib/<name>/manifest.yml` → overlay injection in CMakeLists.txt) or an **addon** (`addons/<name>.yml` → code generation in main.c and prj.conf). Libraries and addons can be mixed freely.
 
 ### Test
 - `run_tests` — Run Zephyr tests via twister. Supports `path` filter, `board`, `filter` (-k), `background` mode. Returns parsed summary.
@@ -38,4 +38,5 @@ Set `workspace_path` in config or pass per-call. Points to the directory contain
 - Test output goes to `.cache/twister/<test_id>/`
 - Default test path is `lib/` under the apps parent directory
 - Library manifests (`lib/<name>/manifest.yml`) declare `default_overlays` used by `create_app`
+- Addon manifests (`addons/<name>.yml`) define code generation modules with `kconfig`, `includes`, `globals`, and `init` sections
 - App manifests (`apps/<name>/manifest.yml`) store description, boards, libraries, template metadata
