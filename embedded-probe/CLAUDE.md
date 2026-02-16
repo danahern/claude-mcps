@@ -72,11 +72,25 @@ src/
 - `stack_trace` — Walk stack frames with symbol resolution
 - `core_dump` — Dump registers + RAM to file (GDB-compatible ELF with elf_path)
 
-### Vendor Tools
+### Vendor Tools (require external CLIs)
 - `esptool_flash` — Flash ESP32 via esptool
 - `esptool_monitor` — Read ESP32 serial output
 - `nrfjprog_flash` — Flash Nordic devices via nrfjprog
+- `nrfutil_program` — Flash Nordic devices via nrfutil (nRF5340 dual-core support)
+- `nrfutil_recover` — Clear APPROTECT via nrfutil
+- `nrfutil_reset` — Reset device via nrfutil
 - `gdb_server` — Start probe-rs GDB server
+
+### Vendor Tool Dependencies
+
+These tools shell out to external CLIs. They fail at call time with an install hint if the CLI is missing.
+
+| Tool | Requires | Install |
+|------|----------|---------|
+| `esptool_flash` | `esptool` | `pip install esptool` |
+| `esptool_monitor` | `pyserial` | `pip install pyserial` |
+| `nrfjprog_flash` | `nrfjprog` | [nRF Command Line Tools](https://www.nordicsemi.com/Products/Development-tools/nRF-Command-Line-Tools) |
+| `nrfutil_program/recover/reset` | `nrfutil` + `device` subcommand | [nRF Util](https://www.nordicsemi.com/Products/Development-tools/nRF-Util), then `nrfutil install device` |
 
 ## Key Implementation Details
 
