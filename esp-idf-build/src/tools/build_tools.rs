@@ -745,17 +745,21 @@ const KNOWN_BRIDGES: &[(&str, &str, &str)] = &[
 
 /// Detect ESP32 devices by scanning serial ports and matching USB VID/PIDs.
 /// On macOS, uses system_profiler SPUSBDataType to get VID/PID info.
+/// On Linux, uses /sys/class/tty/ to read VID/PID from sysfs.
 async fn detect_esp32_devices() -> Vec<DetectedDevice> {
     let mut devices = Vec::new();
 
-    // Scan for serial port devices
+    // Scan for serial port devices (macOS and Linux patterns)
     let serial_ports: Vec<String> = std::fs::read_dir("/dev")
         .into_iter()
         .flat_map(|entries| entries.flatten())
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
+            // macOS patterns
             if name.starts_with("cu.usbserial") || name.starts_with("cu.usbmodem")
                 || name.starts_with("cu.SLAB") || name.starts_with("cu.wchusbserial")
+            // Linux patterns
+                || name.starts_with("ttyUSB") || name.starts_with("ttyACM")
             {
                 Some(format!("/dev/{}", name))
             } else {
@@ -768,14 +772,18 @@ async fn detect_esp32_devices() -> Vec<DetectedDevice> {
         return devices;
     }
 
-    // Get USB device info via system_profiler (macOS)
-    let usb_info = tokio::process::Command::new("system_profiler")
-        .arg("SPUSBDataType")
-        .output()
-        .await
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+    // Get USB device info via system_profiler (macOS only)
+    let usb_info = if cfg!(target_os = "macos") {
+        tokio::process::Command::new("system_profiler")
+            .arg("SPUSBDataType")
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     for port in &serial_ports {
         let mut device = DetectedDevice {
@@ -784,8 +792,34 @@ async fn detect_esp32_devices() -> Vec<DetectedDevice> {
             bridge_chip: None,
         };
 
-        // Try to match VID/PID from system_profiler output
-        if !usb_info.is_empty() {
+        // Linux: read VID/PID from sysfs
+        // sysfs layout: /sys/class/tty/<name>/device/ points to the USB interface,
+        // idVendor/idProduct are on the USB device node one level up (../../)
+        let dev_name = port.trim_start_matches("/dev/");
+        let sysfs_device_path = format!("/sys/class/tty/{}/device/../../", dev_name);
+        if let (Ok(vid_str), Ok(pid_str)) = (
+            std::fs::read_to_string(format!("{}idVendor", sysfs_device_path)),
+            std::fs::read_to_string(format!("{}idProduct", sysfs_device_path)),
+        ) {
+            let vid = vid_str.trim().to_lowercase();
+            let pid = pid_str.trim().to_lowercase();
+            let vid_hex = format!("0x{}", vid);
+            let pid_hex = format!("0x{}", pid);
+            for &(known_vid, known_pid, chip_name) in KNOWN_BRIDGES {
+                if vid_hex == known_vid.to_lowercase() && pid_hex == known_pid.to_lowercase() {
+                    device.vid_pid = Some(format!("{}:{}", vid, pid));
+                    device.bridge_chip = Some(chip_name.to_string());
+                    break;
+                }
+            }
+            // Even if not a known bridge, report the VID:PID
+            if device.vid_pid.is_none() {
+                device.vid_pid = Some(format!("{}:{}", vid, pid));
+            }
+        }
+
+        // macOS: match VID/PID from system_profiler output
+        if device.vid_pid.is_none() && !usb_info.is_empty() {
             for &(vid, pid, chip_name) in KNOWN_BRIDGES {
                 let vid_clean = vid.trim_start_matches("0x");
                 let pid_clean = pid.trim_start_matches("0x");
