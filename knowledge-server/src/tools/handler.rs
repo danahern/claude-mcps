@@ -94,6 +94,26 @@ impl KnowledgeToolHandler {
             .collect()
     }
 
+    /// Get compact item summaries by ID (title + snippet, no full body).
+    async fn get_item_compact_summaries(&self, ids: &[String]) -> Vec<serde_json::Value> {
+        let items = self.items.read().await;
+        ids.iter()
+            .filter_map(|id| {
+                items.get(id).map(|item| {
+                    serde_json::json!({
+                        "id": item.id,
+                        "title": item.title,
+                        "snippet": snippet(&item.body),
+                        "severity": item.severity,
+                        "category": item.category,
+                        "created": item.created,
+                        "updated": item.updated,
+                    })
+                })
+            })
+            .collect()
+    }
+
     /// Get the next sequence number for a given date.
     async fn next_sequence(&self, date: &str) -> u32 {
         let items = self.items.read().await;
@@ -381,17 +401,22 @@ impl KnowledgeToolHandler {
     #[tool(description = "Get recently created or updated knowledge items. Useful for session bootstrapping to see what's new.")]
     async fn recent(&self, Parameters(args): Parameters<RecentArgs>) -> Result<CallToolResult, McpError> {
         let days = args.days.unwrap_or(7);
+        let limit = args.limit.unwrap_or(20) as usize;
 
-        let ids = {
+        let mut ids = {
             let db = self.db.lock().await;
             db.recent_items(days)
                 .map_err(|e| McpError::internal_error(format!("Recent query failed: {}", e), None))?
         };
 
-        let results = self.get_item_summaries(&ids).await;
+        let total = ids.len();
+        ids.truncate(limit);
+
+        let results = self.get_item_compact_summaries(&ids).await;
 
         let output = serde_json::json!({
             "days": days,
+            "total": total,
             "count": results.len(),
             "items": results,
         });
@@ -731,6 +756,27 @@ impl ServerHandler for KnowledgeToolHandler {
             ),
         }
     }
+}
+
+/// Extract a short snippet from a body text: first sentence, truncated to ~150 chars at word boundary.
+pub fn snippet(body: &str) -> String {
+    // Find first sentence boundary
+    let end = body.find(". ")
+        .map(|i| i + 1)
+        .or_else(|| body.find(".\n").map(|i| i + 1))
+        .or_else(|| body.find("\n\n"))
+        .unwrap_or(body.len());
+
+    let first_sentence = &body[..end];
+
+    if first_sentence.len() <= 150 {
+        return first_sentence.trim().to_string();
+    }
+
+    // Truncate at word boundary
+    let truncated = &first_sentence[..150];
+    let last_space = truncated.rfind(' ').unwrap_or(150);
+    format!("{}...", &truncated[..last_space].trim())
 }
 
 /// Infer a topic name from a knowledge item's file patterns and scope.

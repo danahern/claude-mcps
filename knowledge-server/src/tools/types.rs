@@ -106,6 +106,10 @@ pub struct RecentArgs {
     /// Number of days to look back (default: 7)
     #[serde(default)]
     pub days: Option<u32>,
+
+    /// Maximum results to return (default: 20)
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

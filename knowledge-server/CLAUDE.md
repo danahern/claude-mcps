@@ -55,8 +55,9 @@ Mark a knowledge item as validated by an engineer.
 - `validated_by` (required) — Engineer name
 
 #### `recent`
-Items created/updated in last N days.
+Items created/updated in last N days. Returns compact summaries (title + snippet) to minimize context usage.
 - `days` — Lookback period (default: 7)
+- `limit` — Max results (default: 20)
 
 #### `stale`
 Items not updated in N+ days.

@@ -1,5 +1,6 @@
 use knowledge_server::knowledge::KnowledgeItem;
 use knowledge_server::db::KnowledgeDb;
+use knowledge_server::tools::snippet;
 use std::path::Path;
 
 #[test]
@@ -351,4 +352,46 @@ fn test_knowledge_item_searchable_text() {
     assert!(text.contains("nrf54l15dk"));
     assert!(text.contains("probe-rs"));
     assert!(text.contains("flashing"));
+}
+
+#[test]
+fn test_snippet_short_body() {
+    assert_eq!(snippet("Short body."), "Short body.");
+}
+
+#[test]
+fn test_snippet_first_sentence() {
+    assert_eq!(
+        snippet("First sentence. Second sentence. Third sentence."),
+        "First sentence."
+    );
+}
+
+#[test]
+fn test_snippet_newline_paragraph() {
+    assert_eq!(
+        snippet("First paragraph.\n\nSecond paragraph."),
+        "First paragraph."
+    );
+}
+
+#[test]
+fn test_snippet_dot_newline() {
+    assert_eq!(
+        snippet("First line.\nSecond line."),
+        "First line."
+    );
+}
+
+#[test]
+fn test_snippet_truncates_long_sentence() {
+    let long = "A ".repeat(100); // 200 chars, no sentence boundary
+    let result = snippet(&long);
+    assert!(result.len() <= 155, "snippet too long: {} chars", result.len());
+    assert!(result.ends_with("..."));
+}
+
+#[test]
+fn test_snippet_no_sentence_boundary_short() {
+    assert_eq!(snippet("No period here"), "No period here");
 }
