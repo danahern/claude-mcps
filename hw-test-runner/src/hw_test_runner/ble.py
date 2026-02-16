@@ -17,20 +17,20 @@ async def discover(
     """Scan for BLE devices. Optionally filter by advertised service UUID."""
     logger.info("BLE scan: service=%s timeout=%.1fs", service_uuid, timeout)
 
-    devices = await BleakScanner.discover(
-        timeout=timeout,
-        service_uuids=[service_uuid] if service_uuid else None,
-    )
+    scanner = BleakScanner(service_uuids=[service_uuid] if service_uuid else None)
+    await scanner.start()
+    await asyncio.sleep(timeout)
+    await scanner.stop()
 
     results = []
-    for d in devices:
+    for d, adv in scanner.discovered_devices_and_advertisement_data.values():
         entry = {
             "name": d.name or "(unknown)",
             "address": d.address,
-            "rssi": d.rssi,
+            "rssi": adv.rssi,
         }
-        if d.metadata and "uuids" in d.metadata:
-            entry["services"] = d.metadata["uuids"]
+        if adv.service_uuids:
+            entry["services"] = adv.service_uuids
         results.append(entry)
 
     results.sort(key=lambda x: x.get("rssi", -999), reverse=True)

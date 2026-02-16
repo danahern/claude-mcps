@@ -90,17 +90,19 @@ async def find_device(
     timeout: float = 5.0,
 ) -> Optional[str]:
     """Find a device advertising the provisioning service. Returns address."""
-    devices = await BleakScanner.discover(
-        timeout=timeout,
-        service_uuids=[UUID_SVC],
-    )
+    scanner = BleakScanner(service_uuids=[UUID_SVC])
+    await scanner.start()
+    await asyncio.sleep(timeout)
+    await scanner.stop()
+
+    devices = list(scanner.discovered_devices_and_advertisement_data.values())
     if address:
-        for d in devices:
+        for d, _adv in devices:
             if d.address.upper() == address.upper():
                 return d.address
         return None
     if devices:
-        return devices[0].address
+        return devices[0][0].address
     return None
 
 
@@ -191,5 +193,5 @@ async def factory_reset(
         raise RuntimeError("No provisioning device found")
 
     async with BleakClient(device_addr, timeout=timeout) as client:
-        await client.write_gatt_char(UUID_RESET, b"\x01", response=True)
+        await client.write_gatt_char(UUID_RESET, b"\xff", response=True)
         return {"success": True, "message": "Factory reset sent"}
