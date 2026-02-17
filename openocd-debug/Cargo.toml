@@ -1,0 +1,31 @@
+[package]
+name = "openocd-debug"
+version = "0.1.0"
+edition = "2021"
+description = "MCP server for embedded debugging via OpenOCD TCL interface"
+authors = ["Dan Ahern"]
+license = "MIT"
+
+[[bin]]
+name = "openocd-debug"
+path = "src/main.rs"
+
+[lib]
+name = "openocd_debug"
+path = "src/lib.rs"
+
+[dependencies]
+rmcp = { version = "0.3.2", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+schemars = "1"
+thiserror = "2.0"
+tokio-serial = "5.4"
+
+[dev-dependencies]
+tempfile = "3.14"
