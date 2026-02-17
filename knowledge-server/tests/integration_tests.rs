@@ -64,9 +64,14 @@ fn test_load_knowledge_items() {
 
 #[test]
 fn test_knowledge_item_generate_id() {
-    assert_eq!(KnowledgeItem::generate_id("2026-02-14", 1), "k-2026-0214-001");
-    assert_eq!(KnowledgeItem::generate_id("2026-02-14", 12), "k-2026-0214-012");
-    assert_eq!(KnowledgeItem::generate_id("2026-12-31", 100), "k-2026-1231-100");
+    let id = KnowledgeItem::generate_id();
+    assert!(id.starts_with("k-"), "ID should start with 'k-', got: {id}");
+    // Verify UUID portion is valid
+    let uuid_part = &id[2..];
+    assert!(uuid::Uuid::parse_str(uuid_part).is_ok(), "Should be valid UUID: {uuid_part}");
+    // Two IDs should never collide
+    let id2 = KnowledgeItem::generate_id();
+    assert_ne!(id, id2);
 }
 
 #[test]

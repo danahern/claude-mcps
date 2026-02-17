@@ -114,26 +114,6 @@ impl KnowledgeToolHandler {
             .collect()
     }
 
-    /// Get the next sequence number for a given date.
-    async fn next_sequence(&self, date: &str) -> u32 {
-        let items = self.items.read().await;
-        // generate_id produces "k-YYYY-MMDD-NNN", so build a matching prefix
-        let compact = date.replace('-', "");
-        let prefix = if compact.len() == 8 {
-            format!("k-{}-{}-", &compact[..4], &compact[4..])
-        } else {
-            format!("k-{}-", compact)
-        };
-        let max_seq = items.keys()
-            .filter(|id| id.starts_with(&prefix))
-            .filter_map(|id| {
-                id.rsplit('-').next()
-                    .and_then(|s| s.parse::<u32>().ok())
-            })
-            .max()
-            .unwrap_or(0);
-        max_seq + 1
-    }
 }
 
 #[tool_router]
@@ -145,8 +125,7 @@ impl KnowledgeToolHandler {
     #[tool(description = "Capture a new knowledge item. Creates a structured YAML file and indexes it for search. Returns the created item ID and file path.")]
     async fn capture(&self, Parameters(args): Parameters<CaptureArgs>) -> Result<CallToolResult, McpError> {
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let seq = self.next_sequence(&today).await;
-        let id = KnowledgeItem::generate_id(&today, seq);
+        let id = KnowledgeItem::generate_id();
 
         let item = KnowledgeItem {
             id: id.clone(),

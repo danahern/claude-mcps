@@ -58,17 +58,9 @@ fn default_severity() -> String { "informational".to_string() }
 fn default_status() -> String { "unvalidated".to_string() }
 
 impl KnowledgeItem {
-    /// Generate a new ID based on date and sequence number.
-    pub fn generate_id(date: &str, sequence: u32) -> String {
-        // date format: 2026-02-14 → k-2026-0214-001
-        let compact_date = date.replace('-', "");
-        // Take YYYYMMDD -> drop first 0 from month if needed, actually keep full
-        // Format: k-YYYY-MMDD-NNN
-        if compact_date.len() == 8 {
-            format!("k-{}-{}-{:03}", &compact_date[..4], &compact_date[4..], sequence)
-        } else {
-            format!("k-{}-{:03}", compact_date, sequence)
-        }
+    /// Generate a new unique ID using UUID v4.
+    pub fn generate_id() -> String {
+        format!("k-{}", uuid::Uuid::new_v4())
     }
 
     /// Load a knowledge item from a YAML file.
@@ -136,27 +128,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_id_format() {
-        assert_eq!(KnowledgeItem::generate_id("2026-02-16", 1), "k-2026-0216-001");
-        assert_eq!(KnowledgeItem::generate_id("2026-02-16", 5), "k-2026-0216-005");
-        assert_eq!(KnowledgeItem::generate_id("2026-12-01", 42), "k-2026-1201-042");
+    fn generate_id_has_k_prefix() {
+        let id = KnowledgeItem::generate_id();
+        assert!(id.starts_with("k-"), "ID should start with 'k-', got: {id}");
     }
 
     #[test]
-    fn generate_id_prefix_matches_output() {
-        // The prefix used in next_sequence must match IDs from generate_id
-        let date = "2026-02-16";
-        let compact = date.replace('-', "");
-        let prefix = format!("k-{}-{}-", &compact[..4], &compact[4..]);
+    fn generate_id_is_unique() {
+        let id1 = KnowledgeItem::generate_id();
+        let id2 = KnowledgeItem::generate_id();
+        assert_ne!(id1, id2, "Two generated IDs should be different");
+    }
 
-        let id1 = KnowledgeItem::generate_id(date, 1);
-        let id2 = KnowledgeItem::generate_id(date, 99);
-
-        assert!(id1.starts_with(&prefix), "{id1} should start with {prefix}");
-        assert!(id2.starts_with(&prefix), "{id2} should start with {prefix}");
-
-        // Different date should NOT match
-        let other_id = KnowledgeItem::generate_id("2026-02-15", 1);
-        assert!(!other_id.starts_with(&prefix), "{other_id} should NOT start with {prefix}");
+    #[test]
+    fn generate_id_is_valid_uuid() {
+        let id = KnowledgeItem::generate_id();
+        let uuid_part = &id[2..]; // strip "k-"
+        assert!(uuid::Uuid::parse_str(uuid_part).is_ok(), "ID suffix should be valid UUID, got: {uuid_part}");
     }
 }
