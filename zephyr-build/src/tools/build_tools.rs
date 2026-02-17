@@ -73,6 +73,7 @@ const COMMON_BOARDS: &[(&str, &str, &str)] = &[
     ("esp32c3_devkitc", "riscv", "Espressif"),
     ("esp32c6_devkitc", "riscv", "Espressif"),
     ("stm32f4_disco", "arm", "ST"),
+    ("stm32mp157c_dk2", "arm", "ST"),
     ("nucleo_f411re", "arm", "ST"),
     ("nucleo_h743zi", "arm", "ST"),
     ("native_sim", "posix", "Zephyr"),

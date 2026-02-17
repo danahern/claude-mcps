@@ -10,6 +10,7 @@ MCP servers for embedded development with Claude. Each server has its own `CLAUD
 | `zephyr-build/` | Rust | Zephyr RTOS build system (west wrapper) |
 | `elf-analysis/` | Rust | ELF binary size analysis (ROM/RAM breakdown, diffing) |
 | `esp-idf-build/` | Rust | ESP-IDF build, flash, and monitor |
+| `linux-build/` | Rust | Docker-based Linux cross-compilation and SSH deployment |
 | `saleae-logic/` | Python | Logic analyzer capture and protocol decoding |
 | `hw-test-runner/` | Python | BLE and TCP hardware testing (WiFi provisioning, throughput) |
 
@@ -21,6 +22,7 @@ cd embedded-probe && cargo build --release
 cd elf-analysis && cargo build --release
 cd zephyr-build && cargo build --release
 cd esp-idf-build && cargo build --release
+cd linux-build && cargo build --release
 
 # Python servers
 cd saleae-logic && pip install -e .
