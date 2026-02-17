@@ -35,6 +35,12 @@ impl LinuxBuildToolHandler {
     }
 }
 
+impl Default for LinuxBuildToolHandler {
+    fn default() -> Self {
+        Self::new(Config::default())
+    }
+}
+
 fn make_error(msg: impl Into<String>) -> McpError {
     McpError::internal_error(msg.into(), None)
 }
@@ -245,4 +251,147 @@ impl LinuxBuildToolHandler {
 }
 
 #[tool_handler]
-impl ServerHandler for LinuxBuildToolHandler {}
+impl ServerHandler for LinuxBuildToolHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: ProtocolVersion::V_2024_11_05,
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation::from_build_env(),
+            instructions: Some(
+                "Linux Build MCP Server - Docker-based cross-compilation and SSH deployment. \
+                 9 tools available: start_container, stop_container, container_status, \
+                 run_command, build, list_artifacts, collect_artifacts, deploy, ssh_command."
+                    .to_string(),
+            ),
+        }
+    }
+
+    async fn initialize(
+        &self,
+        _request: InitializeRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        info!("Linux Build MCP server initialized with 9 tools");
+        Ok(self.get_info())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::handler::server::tool::Parameters;
+
+    /// Extract text from a CallToolResult's first content element
+    fn extract_text(result: &CallToolResult) -> &str {
+        result.content[0].as_text().expect("expected text content").text.as_str()
+    }
+
+    #[test]
+    fn test_handler_construction() {
+        let handler = LinuxBuildToolHandler::default();
+        assert_eq!(handler.config.docker_image, "stm32mp1-sdk");
+        assert_eq!(handler.config.ssh_user, "root");
+        assert!(handler.config.default_board_ip.is_none());
+    }
+
+    #[test]
+    fn test_handler_with_custom_config() {
+        let config = Config {
+            docker_image: "custom-sdk:v2".to_string(),
+            workspace_dir: Some("/tmp/ws".into()),
+            default_board_ip: Some("192.168.1.50".to_string()),
+            ssh_key: Some("/home/user/.ssh/id_ed25519".into()),
+            ssh_user: "admin".to_string(),
+        };
+        let handler = LinuxBuildToolHandler::new(config.clone());
+        assert_eq!(handler.config.docker_image, "custom-sdk:v2");
+        assert_eq!(handler.config.ssh_user, "admin");
+        assert_eq!(handler.config.default_board_ip.unwrap(), "192.168.1.50");
+    }
+
+    #[test]
+    fn test_server_info() {
+        let handler = LinuxBuildToolHandler::default();
+        let info = handler.get_info();
+        assert!(info.instructions.unwrap().contains("9 tools"));
+    }
+
+    #[tokio::test]
+    async fn test_deploy_missing_file() {
+        let config = Config {
+            default_board_ip: Some("10.0.0.1".to_string()),
+            ..Config::default()
+        };
+        let handler = LinuxBuildToolHandler::new(config);
+        let result = handler
+            .deploy(Parameters(DeployArgs {
+                file_path: "/nonexistent/file.bin".to_string(),
+                remote_path: "/home/root/".to_string(),
+                board_ip: None,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("File not found"));
+    }
+
+    #[tokio::test]
+    async fn test_deploy_no_board_ip() {
+        let handler = LinuxBuildToolHandler::default();
+        let result = handler
+            .deploy(Parameters(DeployArgs {
+                file_path: "/tmp/test.bin".to_string(),
+                remote_path: "/home/root/".to_string(),
+                board_ip: None,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No board IP"));
+    }
+
+    #[tokio::test]
+    async fn test_ssh_command_no_board_ip() {
+        let handler = LinuxBuildToolHandler::default();
+        let result = handler
+            .ssh_command(Parameters(SshCommandArgs {
+                command: "uname -a".to_string(),
+                board_ip: None,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("No board IP"));
+    }
+
+    #[tokio::test]
+    async fn test_container_status_not_found() {
+        let handler = LinuxBuildToolHandler::default();
+        let result = handler
+            .container_status(Parameters(ContainerStatusArgs {
+                container: "nonexistent-container-xyz".to_string(),
+            }))
+            .await;
+
+        // Docker inspect returns "not found" for nonexistent containers
+        // This should succeed with a "not found" status (not error)
+        match result {
+            Ok(r) => {
+                let text = extract_text(&r);
+                assert!(text.contains("not found") || text.contains("nonexistent"));
+            }
+            Err(_) => {
+                // Also acceptable if docker is not installed
+            }
+        }
+    }
+
+    #[test]
+    fn test_make_error() {
+        let err = make_error("test error message");
+        assert!(err.to_string().contains("test error message"));
+    }
+}
