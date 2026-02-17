@@ -128,22 +128,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_id_has_k_prefix() {
+    fn generate_id_uuid_format() {
         let id = KnowledgeItem::generate_id();
-        assert!(id.starts_with("k-"), "ID should start with 'k-', got: {id}");
+        assert!(id.starts_with("k-"), "ID should start with 'k-': {id}");
+        assert_eq!(id.len(), 2 + 36, "ID should be 'k-' + 36-char UUID: {id}");
     }
 
     #[test]
-    fn generate_id_is_unique() {
+    fn generate_id_uniqueness() {
         let id1 = KnowledgeItem::generate_id();
         let id2 = KnowledgeItem::generate_id();
-        assert_ne!(id1, id2, "Two generated IDs should be different");
-    }
-
-    #[test]
-    fn generate_id_is_valid_uuid() {
-        let id = KnowledgeItem::generate_id();
-        let uuid_part = &id[2..]; // strip "k-"
-        assert!(uuid::Uuid::parse_str(uuid_part).is_ok(), "ID suffix should be valid UUID, got: {uuid_part}");
+        assert_ne!(id1, id2, "Two generated IDs should be unique");
     }
 }

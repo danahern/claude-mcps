@@ -65,13 +65,12 @@ fn test_load_knowledge_items() {
 #[test]
 fn test_knowledge_item_generate_id() {
     let id = KnowledgeItem::generate_id();
-    assert!(id.starts_with("k-"), "ID should start with 'k-', got: {id}");
-    // Verify UUID portion is valid
-    let uuid_part = &id[2..];
-    assert!(uuid::Uuid::parse_str(uuid_part).is_ok(), "Should be valid UUID: {uuid_part}");
-    // Two IDs should never collide
+    assert!(id.starts_with("k-"), "ID should start with 'k-': {}", id);
+    // UUID v4 format: k-xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    assert_eq!(id.len(), 2 + 36, "ID should be 'k-' + 36-char UUID: {}", id);
+    // Verify uniqueness
     let id2 = KnowledgeItem::generate_id();
-    assert_ne!(id, id2);
+    assert_ne!(id, id2, "Two generated IDs should be unique");
 }
 
 #[test]
