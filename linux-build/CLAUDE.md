@@ -1,6 +1,6 @@
 # linux-build
 
-Docker-based Linux cross-compilation and SSH deployment MCP server. Wraps Docker CLI for container lifecycle and SSH/SCP for board deployment.
+Docker-based Linux cross-compilation, ADB/SSH deployment, Yocto build tracking, and board connection management MCP server.
 
 ## Build
 
@@ -8,17 +8,39 @@ Docker-based Linux cross-compilation and SSH deployment MCP server. Wraps Docker
 cargo build --release
 ```
 
-## Tools
+## Tools (17)
 
-- `start_container` — Start Docker container with optional workspace mount, returns container name
+### Container Lifecycle
+- `start_container` — Start Docker container with optional workspace mount and extra volumes, returns container name
 - `stop_container` — Stop and remove a container
 - `container_status` — Check container state (running/exited/not found)
+
+### Build Operations
 - `run_command` — Execute arbitrary command in container via `docker exec`
 - `build` — Run build command in container (default: `make` in `/workspace`)
 - `list_artifacts` — List files in container's `/artifacts` directory
+
+### SSH Deployment
 - `collect_artifacts` — Copy files from container to host via `docker cp`
 - `deploy` — SCP file to board (requires board_ip from arg or --board-ip)
 - `ssh_command` — Run command on board via SSH
+
+### ADB Transport
+- `adb_shell` — Run shell command on device via ADB
+- `adb_deploy` — Push file to device via ADB
+- `adb_pull` — Pull file from device via ADB
+
+### Flash Image
+- `flash_image` — Stream compressed WIC image to board via SSH or ADB (`bzcat | dd`)
+
+### Yocto Build
+- `yocto_build` — Run bitbake in container (foreground or background mode)
+- `yocto_build_status` — Check background build status, elapsed time, and truncated output
+
+### Board Connection
+- `board_connect` — Register SSH/ADB/auto board connection, returns board_id
+- `board_disconnect` — Remove a board connection
+- `board_status` — Check connection status (single or list all)
 
 ## Multi-Board Usage
 
@@ -29,30 +51,40 @@ The `image` parameter in `start_container` selects the Docker image per board:
 | STM32MP1 | `stm32mp1-sdk` (default) | `make -C /workspace/firmware/linux/apps all install` |
 | Alif E7 | `alif-e7-sdk` | `make -C /workspace/firmware/linux/apps BOARD=alif-e7 all install` |
 
-```
-# STM32MP1
-start_container(name="stm32mp1-build", image="stm32mp1-sdk", workspace_dir="...")
-build(container, command="make -C /workspace/firmware/linux/apps all install")
+### Yocto builds with meta-eai
 
-# Alif E7
-start_container(name="alif-e7-build", image="alif-e7-sdk", workspace_dir="...")
-build(container, command="make -C /workspace/firmware/linux/apps BOARD=alif-e7 all install")
+```
+start_container(
+  name="yocto-build",
+  image="yocto-builder",
+  extra_volumes=[
+    "yocto-data:/home/builder/yocto",
+    "/path/to/firmware/linux/yocto/meta-eai:/home/builder/yocto/meta-eai"
+  ]
+)
+yocto_build(container="yocto-build", build_dir="build-stm32mp1", background=true)
+yocto_build_status(build_id="...")
 ```
 
-No MCP code changes needed — `start_container` already accepts per-call `image` override via `types.rs`.
+The bind mount overlays the named volume path, so `bblayers.conf` references resolve correctly.
 
 ## Architecture
 
-- `config.rs` — CLI args (clap) and runtime config
-- `docker_client.rs` — Docker CLI wrapper (start/stop/exec/cp) + SSH/SCP functions
-- `tools/types.rs` — Serde/JsonSchema arg types for each tool
-- `tools/linux_build_tools.rs` — RMCP tool handler (9 tools)
+- `config.rs` — CLI args (clap) and runtime config (board IP, ADB serial, SSH)
+- `docker_client.rs` — Docker CLI wrapper (start/stop/exec/cp) + SSH/SCP + flash_image_ssh
+- `adb_client.rs` — ADB CLI wrapper (shell/push/pull/devices/flash_image_adb)
+- `tools/types.rs` — Serde/JsonSchema arg types for all 17 tools
+- `tools/linux_build_tools.rs` — RMCP tool handler, Yocto build state, board connection state
 - `main.rs` — Entry point, logging setup
 
 ## Key Details
 
 - Containers mount host workspace at `/workspace` and create `/artifacts` for outputs
 - Container name auto-generated as `linux-build-<uuid8>` if not provided
+- `extra_volumes` on `start_container` adds arbitrary `-v` mounts (named or bind)
 - Deploy/SSH tools require board IP — pass as arg or configure with `--board-ip`
-- No internal container state tracking — queries Docker directly
+- ADB tools use `--adb-serial` default or per-call `serial` parameter
+- Yocto builds track state in `Arc<RwLock<HashMap>>` — background builds via `tokio::spawn`
+- Board connections store transport details; subsequent tools can reference `board_id`
+- Flash image uses `spawn_blocking` to pipe `bzcat` stdout into SSH/ADB `dd`
 - Default Docker image: `stm32mp1-sdk` (configurable via `--docker-image`)

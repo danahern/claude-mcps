@@ -29,6 +29,10 @@ pub struct Args {
     #[arg(long, default_value = "root")]
     pub ssh_user: String,
 
+    /// Default ADB device serial number
+    #[arg(long)]
+    pub adb_serial: Option<String>,
+
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -46,6 +50,7 @@ pub struct Config {
     pub default_board_ip: Option<String>,
     pub ssh_key: Option<PathBuf>,
     pub ssh_user: String,
+    pub default_adb_serial: Option<String>,
 }
 
 impl Config {
@@ -56,6 +61,7 @@ impl Config {
             default_board_ip: args.board_ip.clone(),
             ssh_key: args.ssh_key.clone(),
             ssh_user: args.ssh_user.clone(),
+            default_adb_serial: args.adb_serial.clone(),
         }
     }
 }
@@ -68,6 +74,7 @@ impl Default for Config {
             default_board_ip: None,
             ssh_key: None,
             ssh_user: "root".to_string(),
+            default_adb_serial: None,
         }
     }
 }

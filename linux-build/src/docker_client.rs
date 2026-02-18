@@ -21,6 +21,7 @@ pub async fn start_container(
     image: &str,
     container_name: &str,
     workspace_dir: Option<&Path>,
+    extra_volumes: &[String],
 ) -> Result<String, DockerError> {
     info!("Starting container '{}' from image '{}'", container_name, image);
 
@@ -32,6 +33,11 @@ pub async fn start_container(
     // Mount workspace if provided
     if let Some(ws) = workspace_dir {
         cmd.arg("-v").arg(format!("{}:/workspace", ws.display()));
+    }
+
+    // Mount extra volumes
+    for vol in extra_volumes {
+        cmd.arg("-v").arg(vol);
     }
 
     // Create /artifacts directory for build outputs
@@ -215,6 +221,58 @@ pub async fn ssh_command(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         exit_code: output.status.code().unwrap_or(-1),
     })
+}
+
+/// Flash a compressed WIC image to a board via SSH
+///
+/// Pipes `bzcat <image>` into `ssh <user>@<ip> dd of=<device> bs=4M`
+pub async fn flash_image_ssh(
+    image_path: &str,
+    user: &str,
+    board_ip: &str,
+    device: &str,
+    ssh_key: Option<&Path>,
+) -> Result<String, DockerError> {
+    info!("Flashing {} to {}@{}:{}", image_path, user, board_ip, device);
+
+    // Use std::process for piping bzcat into ssh — Tokio's ChildStdout
+    // doesn't impl Into<Stdio>, so we use blocking spawn for the pipeline.
+    let output = tokio::task::spawn_blocking({
+        let image_path = image_path.to_string();
+        let user = user.to_string();
+        let board_ip = board_ip.to_string();
+        let device = device.to_string();
+        let ssh_key = ssh_key.map(|p| p.to_path_buf());
+        move || {
+            let bzcat = std::process::Command::new("bzcat")
+                .arg(&image_path)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| DockerError::CommandFailed(format!("Failed to start bzcat: {}", e)))?;
+
+            let bzcat_stdout = bzcat.stdout.expect("bzcat stdout was piped");
+
+            let mut ssh_cmd = std::process::Command::new("ssh");
+            ssh_cmd.arg("-o").arg("StrictHostKeyChecking=no")
+                .arg("-o").arg("ConnectTimeout=10");
+            if let Some(key) = &ssh_key {
+                ssh_cmd.arg("-i").arg(key);
+            }
+            ssh_cmd.arg(format!("{}@{}", user, board_ip))
+                .arg(format!("dd of={} bs=4M", device))
+                .stdin(bzcat_stdout);
+
+            ssh_cmd.output().map_err(|e| DockerError::CommandFailed(format!("SSH flash failed: {}", e)))
+        }
+    }).await.map_err(|e| DockerError::CommandFailed(format!("Task join failed: {}", e)))??;
+
+    if output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(stderr.trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(DockerError::CommandFailed(format!("Flash failed: {}", stderr.trim())))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
