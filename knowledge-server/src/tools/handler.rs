@@ -687,9 +687,9 @@ impl KnowledgeToolHandler {
         let _dry_run = args.dry_run.unwrap_or(false);
         let items = self.items.read().await;
 
-        // Collect critical, validated items
+        // Collect critical, validated items — only validated items reach Tier 1
         let mut gotcha_items: Vec<&KnowledgeItem> = items.values()
-            .filter(|i| i.severity == "critical" && !i.deprecated)
+            .filter(|i| i.severity == "critical" && !i.deprecated && i.status == "validated")
             .collect();
 
         gotcha_items.sort_by(|a, b| a.title.cmp(&b.title));
@@ -703,13 +703,24 @@ impl KnowledgeToolHandler {
             content.push_str(&format!("- **{}**: {}\n", item.title, first_line));
         }
 
+        // Count critical items that were excluded due to not being validated
+        let unvalidated_critical: Vec<&KnowledgeItem> = items.values()
+            .filter(|i| i.severity == "critical" && !i.deprecated && i.status != "validated")
+            .collect();
+
         let output = serde_json::json!({
             "gotcha_count": gotcha_items.len(),
+            "unvalidated_critical_count": unvalidated_critical.len(),
             "content": content,
             "items": gotcha_items.iter().map(|i| serde_json::json!({
                 "id": i.id,
                 "title": i.title,
                 "severity": i.severity,
+            })).collect::<Vec<_>>(),
+            "unvalidated_critical": unvalidated_critical.iter().map(|i| serde_json::json!({
+                "id": i.id,
+                "title": i.title,
+                "status": i.status,
             })).collect::<Vec<_>>(),
         });
 
