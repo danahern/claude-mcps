@@ -76,6 +76,45 @@ class TestParseLoadbinOutput:
         assert len(results) == 1
         assert results[0] == {"file": "test.bin", "success": True}
 
+    def test_halt_error_not_treated_as_failure(self):
+        """'Failed to halt CPU' between download and O.K. should not fail."""
+        stdout = (
+            "Downloading file [/tmp/bl32.bin]...\n"
+            "O.K.\n"
+            "****** Error: Failed to halt CPU.\n"
+            "Downloading file [/tmp/xipImage]...\n"
+            "****** Error: Failed to halt CPU.\n"
+            "O.K.\n"
+        )
+        results = _parse_loadbin_output(stdout)
+        assert len(results) == 2
+        assert all(r["success"] for r in results)
+
+    def test_unsupported_format(self):
+        """JLinkExe rejects non-.bin extensions with 'unsupported format'."""
+        stdout = (
+            "Downloading file [/tmp/appkit-e7.dtb]...\n"
+            "File is of unknown / unsupported format.\n"
+        )
+        results = _parse_loadbin_output(stdout)
+        assert len(results) == 1
+        assert results[0]["success"] is False
+        assert "unsupported" in results[0]["error"].lower()
+        assert results[0]["file"] == "appkit-e7.dtb"
+
+    def test_mixed_with_unsupported(self):
+        """One .bin succeeds, one non-.bin gets unsupported format."""
+        stdout = (
+            "Downloading file [/tmp/bl32.bin]...\n"
+            "O.K.\n"
+            "Downloading file [/tmp/appkit-e7.dtb]...\n"
+            "File is of unknown / unsupported format.\n"
+        )
+        results = _parse_loadbin_output(stdout)
+        assert len(results) == 2
+        assert results[0]["success"] is True
+        assert results[1]["success"] is False
+
 
 class TestMramLayout:
     def test_all_components_defined(self):

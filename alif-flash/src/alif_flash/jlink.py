@@ -98,12 +98,20 @@ def _run_jlink(script_content: str, timeout: int = 120) -> dict:
             capture_output=True, text=True, timeout=timeout,
         )
         stdout = result.stdout
-        ok = result.returncode == 0 or "Verify successful" in stdout
 
-        # Check for connection failures
+        # Check for real connection failures (not "Failed to halt CPU" which is expected)
         if "Could not connect" in stdout or "No J-Link found" in stdout:
             return {"success": False, "message": "J-Link not connected",
                     "stdout": stdout[-1000:]}
+        if "Writing target memory failed" in stdout:
+            return {"success": False, "message": "MRAM write failed",
+                    "stdout": stdout[-1000:]}
+        if "unsupported format" in stdout.lower():
+            return {"success": False, "message": "File format rejected by JLinkExe (extension issue)",
+                    "stdout": stdout[-1000:]}
+
+        # "Failed to halt CPU" is normal — writes succeed anyway
+        ok = True
 
         return {"success": ok, "returncode": result.returncode,
                 "stdout": stdout, "stderr": result.stderr}
@@ -119,7 +127,7 @@ def _parse_loadbin_output(stdout: str) -> list[dict]:
     """Parse JLinkExe output to extract per-file results."""
     results = []
     # Match lines like: "Downloading file [/path/to/file.bin]..."
-    # Followed by "O.K." or "Writing target memory failed."
+    # Followed by "O.K.", "Writing target memory failed.", or "unsupported format"
     lines = stdout.split("\n")
     current_file = None
     for line in lines:
@@ -129,7 +137,10 @@ def _parse_loadbin_output(stdout: str) -> list[dict]:
         elif current_file and "O.K." in line:
             results.append({"file": current_file, "success": True})
             current_file = None
-        elif current_file and "failed" in line.lower():
+        elif current_file and "Writing target memory failed" in line:
+            results.append({"file": current_file, "success": False, "error": line.strip()})
+            current_file = None
+        elif current_file and "unsupported format" in line.lower():
             results.append({"file": current_file, "success": False, "error": line.strip()})
             current_file = None
 
@@ -173,59 +184,84 @@ def flash_images(image_dir: str, components: list[str] | None = None,
             return {"success": False, "message": f"File not found: {path}"}
         files_to_flash.append((comp, path, info["addr"]))
 
-    # Build JLink command script
-    lines = []
+    # JLinkExe loadbin rejects files with non-.bin extensions (.dtb, .img, etc.)
+    # Copy such files to a temp directory with .bin extension.
+    tmp_dir = None
+    load_files = []  # (comp, load_path, orig_path, addr) — load_path may differ from orig
     for comp, path, addr in files_to_flash:
-        lines.append(f"loadbin {path} 0x{addr:08X}")
-    if verify:
-        lines.append("")
-        for comp, path, addr in files_to_flash:
-            lines.append(f"verifybin {path} 0x{addr:08X}")
-    lines.append("exit")
-    script = "\n".join(lines) + "\n"
+        if path.endswith(".bin"):
+            load_files.append((comp, path, path, addr))
+        else:
+            if tmp_dir is None:
+                tmp_dir = tempfile.mkdtemp(prefix="jlink_")
+            base = os.path.splitext(os.path.basename(path))[0] or os.path.basename(path)
+            tmp_path = os.path.join(tmp_dir, base + ".bin")
+            shutil.copy2(path, tmp_path)
+            load_files.append((comp, tmp_path, path, addr))
 
-    # Calculate total size
-    total_bytes = sum(os.path.getsize(p) for _, p, _ in files_to_flash)
+    try:
+        # Build JLink command script
+        lines = []
+        for comp, load_path, orig_path, addr in load_files:
+            lines.append(f"loadbin {load_path} 0x{addr:08X}")
+        if verify:
+            lines.append("")
+            for comp, load_path, orig_path, addr in load_files:
+                lines.append(f"verifybin {load_path} 0x{addr:08X}")
+        lines.append("exit")
+        script = "\n".join(lines) + "\n"
 
-    logger.info("Flashing %d components (%d KB) via J-Link...",
-                len(files_to_flash), total_bytes // 1024)
-    for comp, path, addr in files_to_flash:
-        size = os.path.getsize(path)
-        logger.info("  %-10s %s @ 0x%08X (%d bytes)", comp, os.path.basename(path), addr, size)
+        # Calculate total size
+        total_bytes = sum(os.path.getsize(p) for _, _, p, _ in load_files)
 
-    t0 = time.time()
-    result = _run_jlink(script, timeout=300)
-    elapsed = time.time() - t0
+        logger.info("Flashing %d components (%d KB) via J-Link...",
+                    len(load_files), total_bytes // 1024)
+        for comp, load_path, orig_path, addr in load_files:
+            size = os.path.getsize(orig_path)
+            logger.info("  %-10s %s @ 0x%08X (%d bytes)", comp, os.path.basename(orig_path), addr, size)
 
-    if not result["success"]:
+        t0 = time.time()
+        result = _run_jlink(script, timeout=300)
+        elapsed = time.time() - t0
+
+        if not result["success"]:
+            return {
+                "success": False,
+                "message": result.get("message", "JLinkExe failed"),
+                "stdout": result.get("stdout", "")[-1000:],
+                "elapsed_seconds": round(elapsed, 1),
+            }
+
+        # Parse per-file results — map temp .bin names back to originals
+        file_results = _parse_loadbin_output(result["stdout"])
+        tmp_to_orig = {}
+        for comp, load_path, orig_path, addr in load_files:
+            tmp_to_orig[os.path.basename(load_path)] = os.path.basename(orig_path)
+        for r in file_results:
+            r["file"] = tmp_to_orig.get(r["file"], r["file"])
+
+        all_ok = all(r["success"] for r in file_results) if file_results else False
+
+        # Check verify results
+        verified = "Verify successful" in result.get("stdout", "") if verify else None
+
         return {
-            "success": False,
-            "message": result.get("message", "JLinkExe failed"),
-            "stdout": result.get("stdout", "")[-1000:],
+            "success": all_ok,
+            "method": "jlink_loadbin",
+            "total_bytes": total_bytes,
             "elapsed_seconds": round(elapsed, 1),
+            "bytes_per_second": round(total_bytes / elapsed) if elapsed > 0 else 0,
+            "components": len(files_to_flash),
+            "files": file_results,
+            "verified": verified,
+            "message": (
+                f"{'All' if all_ok else 'Some'} images written via J-Link in {elapsed:.1f}s. "
+                "Power cycle (unplug/replug PRG_USB) for A32 to boot."
+            ),
         }
-
-    # Parse per-file results
-    file_results = _parse_loadbin_output(result["stdout"])
-    all_ok = all(r["success"] for r in file_results) if file_results else False
-
-    # Check verify results
-    verified = "Verify successful" in result.get("stdout", "") if verify else None
-
-    return {
-        "success": all_ok,
-        "method": "jlink_loadbin",
-        "total_bytes": total_bytes,
-        "elapsed_seconds": round(elapsed, 1),
-        "bytes_per_second": round(total_bytes / elapsed) if elapsed > 0 else 0,
-        "components": len(files_to_flash),
-        "files": file_results,
-        "verified": verified,
-        "message": (
-            f"{'All' if all_ok else 'Some'} images written via J-Link in {elapsed:.1f}s. "
-            "Power cycle (unplug/replug PRG_USB) for A32 to boot."
-        ),
-    }
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def flash_from_config(config_path: str, verify: bool = False) -> dict:
