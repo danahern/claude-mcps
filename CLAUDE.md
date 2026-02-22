@@ -13,6 +13,7 @@ MCP servers for embedded development with Claude. Each server has its own `CLAUD
 | `linux-build/` | Rust | Docker-based Linux cross-compilation and SSH deployment |
 | `saleae-logic/` | Python | Logic analyzer capture and protocol decoding |
 | `hw-test-runner/` | Python | BLE and TCP hardware testing (WiFi provisioning, throughput) |
+| `alif-flash/` | Python | Alif E7 MRAM flash via SE-UART ISP protocol |
 
 ## Building
 
@@ -27,6 +28,7 @@ cd linux-build && cargo build --release
 # Python servers
 cd saleae-logic && pip install -e .
 cd hw-test-runner && pip install -e .
+cd alif-flash && pip install -e .
 ```
 
 ## Adding a New MCP Server

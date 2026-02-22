@@ -1,0 +1,16 @@
+/*
+ * JLink script for Alif Ensemble E7 MRAM programming.
+ *
+ * Overrides ResetTarget() to prevent reset during loadbin.
+ * The SE controls core power-up — resetting via SWD kills AP[3]
+ * (M55_HP) and makes memory access impossible.
+ *
+ * Also overrides SetupTarget() to configure connection without halt.
+ */
+
+int ResetTarget(void) {
+  // Do NOT reset — SE manages the boot sequence.
+  // Resetting via debug interface kills AP[3] (M55_HP).
+  Report("Alif E7: Skipping reset (SE-managed boot)");
+  return 0;
+}
