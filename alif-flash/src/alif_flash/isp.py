@@ -161,7 +161,7 @@ def reset_via_jlink(device: str = "Cortex-A32", interface: str = "SWD",
     try:
         result = subprocess.run(
             [jlink, "-device", device, "-if", interface, "-speed", str(speed),
-             "-autoconnect", "1", "-CommanderScript", script_path],
+             "-autoconnect", "1", "-NoGui", "1", "-CommanderScript", script_path],
             capture_output=True, text=True, timeout=15,
         )
         logger.info("JLink reset: rc=%d", result.returncode)

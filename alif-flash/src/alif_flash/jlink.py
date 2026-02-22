@@ -94,6 +94,7 @@ def _run_jlink(script_content: str, timeout: int = 120) -> dict:
         result = subprocess.run(
             [JLINK_EXE, "-device", DEVICE, "-if", INTERFACE,
              "-speed", str(SPEED), "-autoconnect", "1",
+             "-NoGui", "1",
              "-CommandFile", script_path],
             capture_output=True, text=True, timeout=timeout,
         )
