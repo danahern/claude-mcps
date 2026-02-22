@@ -1,4 +1,4 @@
-"""MCP server for Alif E7 MRAM flash — SE-UART ISP protocol."""
+"""MCP server for Alif E7 MRAM flash — SE-UART ISP and J-Link."""
 
 import json
 import logging
@@ -101,6 +101,47 @@ TOOLS = [
                 },
             },
             "required": ["config"],
+        },
+    ),
+    Tool(
+        name="jlink_flash",
+        description="Flash Linux images to MRAM via J-Link loadbin (~44 KB/s, 9x faster than SE-UART). Board must be freshly power-cycled. Auto-installs JLink device definition if needed.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "image_dir": {
+                    "type": "string",
+                    "description": "Directory containing image files. If using config, this is auto-resolved.",
+                },
+                "config": {
+                    "type": "string",
+                    "description": "ATOC JSON config path (alternative to image_dir — extracts files and addresses from config).",
+                },
+                "components": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["tfa", "dtb", "kernel", "rootfs"]},
+                    "description": "Which components to flash (default: all). Only used with image_dir.",
+                },
+                "verify": {
+                    "type": "boolean",
+                    "description": "Verify after programming (default: false)",
+                    "default": False,
+                },
+            },
+        },
+    ),
+    Tool(
+        name="jlink_setup",
+        description="Check or install J-Link device definition for Alif E7 MRAM programming. Run once before using jlink_flash.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "install": {
+                    "type": "boolean",
+                    "description": "Install device definition if not present (default: false, just check)",
+                    "default": False,
+                },
+            },
         },
     ),
     Tool(
@@ -224,6 +265,32 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
                 isp.flash_images, port, config_path, enter_maint,
                 do_wait_for_replug=wait_replug, jlink_reset=jlink_reset
             )
+            return _json(result)
+
+        case "jlink_flash":
+            from . import jlink
+            config = args.get("config")
+            verify = args.get("verify", False)
+            if config:
+                if not os.path.isabs(config) and setools_dir:
+                    config = os.path.join(setools_dir, config)
+                result = await asyncio.to_thread(
+                    jlink.flash_from_config, config, verify)
+            else:
+                image_dir = args.get("image_dir", "")
+                if not image_dir:
+                    return _text("Error: provide either 'image_dir' or 'config'")
+                components = args.get("components")
+                result = await asyncio.to_thread(
+                    jlink.flash_images, image_dir, components, verify)
+            return _json(result)
+
+        case "jlink_setup":
+            from . import jlink
+            if args.get("install", False):
+                result = await asyncio.to_thread(jlink.install_device_def)
+            else:
+                result = jlink.check_setup()
             return _json(result)
 
         case "monitor":
