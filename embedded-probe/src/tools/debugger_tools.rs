@@ -126,7 +126,25 @@ impl EmbeddedDebuggerToolHandler {
         let selected_probe = if args.probe_selector.to_lowercase() == "auto" {
             probes.first()
         } else {
-            probes.iter().find(|p| p.identifier.contains(&args.probe_selector))
+            let selector = &args.probe_selector;
+            // Try serial number match first (exact or substring)
+            probes.iter().find(|p| {
+                p.serial_number.as_ref().map_or(false, |sn| sn == selector || sn.contains(selector.as_str()))
+            })
+            // Then try VID:PID format (e.g. "1366:1024")
+            .or_else(|| {
+                if let Some((vid_str, pid_str)) = selector.split_once(':') {
+                    if let (Ok(vid), Ok(pid)) = (
+                        u16::from_str_radix(vid_str.trim_start_matches("0x"), 16),
+                        u16::from_str_radix(pid_str.trim_start_matches("0x"), 16),
+                    ) {
+                        return probes.iter().find(|p| p.vendor_id == vid && p.product_id == pid);
+                    }
+                }
+                None
+            })
+            // Fall back to identifier substring match
+            .or_else(|| probes.iter().find(|p| p.identifier.contains(selector.as_str())))
         };
 
         match selected_probe {
