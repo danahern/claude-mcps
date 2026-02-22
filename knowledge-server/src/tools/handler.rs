@@ -609,7 +609,7 @@ impl KnowledgeToolHandler {
         let mut pattern_groups: HashMap<String, Vec<&KnowledgeItem>> = HashMap::new();
 
         for item in items.values() {
-            if item.deprecated || item.file_patterns.is_empty() {
+            if item.deprecated || item.status != "validated" || item.file_patterns.is_empty() {
                 continue;
             }
             // Use the first file pattern's "topic" as the group key
