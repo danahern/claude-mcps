@@ -2,6 +2,15 @@
 
 Alif E7 MRAM flash MCP server — two methods: SE-UART ISP (57600 baud) and J-Link loadbin (~44 KB/s).
 
+## CRITICAL: Always use J-Link for flashing images
+
+**NEVER use `flash()` (SE-UART) for image updates. ALWAYS use `jlink_flash()` instead.**
+
+- `jlink_flash`: ~44 KB/s, all 4 images in ~78 seconds
+- `flash` (SE-UART): ~5 KB/s, all 4 images in ~19 minutes
+
+The ONLY reason to use SE-UART `flash()` is for initial ATOC setup (first-ever flash) or if J-Link is physically unavailable. For all routine image flashing, use `jlink_flash`.
+
 ## Setup
 
 ```bash
