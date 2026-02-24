@@ -1,4 +1,4 @@
-"""Tests for J-Link MRAM programming: output parsing, setup checks, script generation."""
+"""Tests for J-Link flash programming: output parsing, setup checks, config parsing (MRAM + OSPI)."""
 
 import json
 import os
@@ -8,6 +8,8 @@ from unittest.mock import patch
 from alif_flash.jlink import (
     MRAM_LAYOUT,
     ATOC_KEY_MAP,
+    OSPI_ADDR_THRESHOLD,
+    OSPI_FLM_NAME,
     _parse_loadbin_output,
     check_setup,
     flash_from_config,
@@ -312,3 +314,150 @@ class TestFlashFromConfig:
             components = mock_flash.call_args[0][1]
             assert "tfa" in components
             assert "metadata" not in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_address_field_preferred(self, mock_flash):
+        """Generic 'address' field is supported and preferred over mramAddress."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "KERNEL": {"binary": "xipImage", "address": "0xC0100000"},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "kernel" in components
+            # Check the injected address is the OSPI address
+            assert MRAM_LAYOUT.get("kernel", {}).get("addr") != 0xC0100000  # cleaned up
+        # Verify cleanup happened
+        assert MRAM_LAYOUT["kernel"]["addr"] == 0x80020000
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_ospi_address_field(self, mock_flash):
+        """'ospiAddress' field is supported for OSPI entries."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "ROOTFS": {"binary": "rootfs.cramfs", "ospiAddress": "0xC0300000"},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "rootfs" in components
+        # Verify original layout restored
+        assert MRAM_LAYOUT["rootfs"]["addr"] == 0x80300000
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_address_takes_priority_over_mram(self, mock_flash):
+        """When both 'address' and 'mramAddress' present, 'address' wins."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "KERNEL": {
+                    "binary": "xipImage",
+                    "address": "0xC0100000",
+                    "mramAddress": "0x80020000",
+                },
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+
+            # Capture the layout injected during flash_from_config
+            injected_addr = []
+            original_flash = mock_flash.side_effect
+
+            def capture_layout(images_dir, components, verify=False):
+                injected_addr.append(MRAM_LAYOUT["kernel"]["addr"])
+                return {"success": True}
+
+            mock_flash.side_effect = capture_layout
+            flash_from_config(config_path)
+            assert injected_addr[0] == 0xC0100000
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_mixed_mram_ospi_config(self, mock_flash):
+        """Config with both MRAM and OSPI entries is processed correctly."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+                "DTB": {"binary": "appkit-e7.dtb", "mramAddress": "0x80010000"},
+                "KERNEL": {"binary": "xipImage", "address": "0xC0100000"},
+                "ROOTFS": {"binary": "rootfs.cramfs", "address": "0xC0300000"},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert len(components) == 4
+            assert "tfa" in components
+            assert "dtb" in components
+            assert "kernel" in components
+            assert "rootfs" in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_mram_address_still_works(self, mock_flash):
+        """Backward compat: mramAddress alone still works."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "tfa" in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_entry_without_any_address_skipped(self, mock_flash):
+        """Entries missing all address fields are skipped."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+                "METADATA": {"binary": "meta.bin"},  # no address at all
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "metadata" not in components
+
+
+class TestCheckSetupFLM:
+    """Tests for OSPI flash loader detection in check_setup()."""
+
+    @patch("alif_flash.jlink.os.path.exists")
+    def test_flm_missing_adds_warning(self, mock_exists):
+        """Missing FLM file produces a warning, not an error."""
+        def exists_side_effect(path):
+            if OSPI_FLM_NAME in path:
+                return False
+            return True  # JLinkExe, Devices.xml, JLinkScript all present
+        mock_exists.side_effect = exists_side_effect
+        result = check_setup()
+        assert result["ready"] is True  # still ready — FLM is optional
+        assert "warnings" in result
+        assert any(OSPI_FLM_NAME in w for w in result["warnings"])
+
+    @patch("alif_flash.jlink.os.path.exists")
+    def test_flm_present_no_warning(self, mock_exists):
+        """When FLM is present, no warnings."""
+        mock_exists.return_value = True
+        result = check_setup()
+        assert result["ready"] is True
+        assert "warnings" not in result
+
+
+class TestOspiConstants:
+    """Tests for OSPI-related constants."""
+
+    def test_ospi_threshold(self):
+        assert OSPI_ADDR_THRESHOLD == 0xA0000000
+
+    def test_ospi_flm_name(self):
+        assert OSPI_FLM_NAME == "Ensemble_IS25WX256.FLM"
+
+    def test_mram_addresses_below_threshold(self):
+        """All MRAM addresses should be below the OSPI threshold."""
+        for comp, info in MRAM_LAYOUT.items():
+            assert info["addr"] < OSPI_ADDR_THRESHOLD, (
+                f"{comp} addr 0x{info['addr']:08X} >= OSPI threshold"
+            )
