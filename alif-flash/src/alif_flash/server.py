@@ -72,7 +72,7 @@ TOOLS = [
     ),
     Tool(
         name="flash",
-        description="Write ATOC package + all images to MRAM from an ATOC JSON config. Writes AppTocPackage.bin to 0x80000000 first, then TFA/DTB/KERNEL/ROOTFS. Board must be in maintenance mode.",
+        description="Write ATOC package + all images to MRAM from an ATOC JSON config. Writes AppTocPackage.bin first, then all config entries with mramAddress+binary fields. Board must be in maintenance mode.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -105,7 +105,7 @@ TOOLS = [
     ),
     Tool(
         name="jlink_flash",
-        description="Flash Linux images to MRAM via J-Link loadbin (~44 KB/s, 9x faster than SE-UART). Board must be freshly power-cycled. Auto-installs JLink device definition if needed.",
+        description="Flash images to MRAM via J-Link loadbin (~44 KB/s, 9x faster than SE-UART). With config, flashes all entries with mramAddress+binary fields. Board must be freshly power-cycled. Auto-installs JLink device definition if needed.",
         inputSchema={
             "type": "object",
             "properties": {

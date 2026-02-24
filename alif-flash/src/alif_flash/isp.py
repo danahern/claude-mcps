@@ -493,8 +493,9 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
     else:
         logger.warning("AppTocPackage.bin not found at %s — run gen_toc first", atoc_path)
 
-    for key in ("TFA", "DTB", "KERNEL", "ROOTFS"):
-        entry = config.get(key, {})
+    for key, entry in config.items():
+        if key == "DEVICE" or not isinstance(entry, dict):
+            continue
         if entry.get("disabled", False):
             continue
         binary = entry.get("binary")

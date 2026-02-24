@@ -1,13 +1,16 @@
 """Tests for J-Link MRAM programming: output parsing, setup checks, script generation."""
 
+import json
 import os
 import tempfile
+from unittest.mock import patch
 
 from alif_flash.jlink import (
     MRAM_LAYOUT,
     ATOC_KEY_MAP,
     _parse_loadbin_output,
     check_setup,
+    flash_from_config,
     JLINK_DEVICES_DIR,
 )
 
@@ -176,3 +179,136 @@ class TestFlashImages:
             result = flash_images(d, components=["tfa"])
             assert result["success"] is False
             assert "not found" in result["message"]
+
+
+class TestFlashFromConfig:
+    """Tests for flash_from_config config parsing and generic key handling."""
+
+    def _make_config_dir(self, tmp, config_data):
+        """Create a config dir structure: tmp/config/<name>.json + tmp/images/."""
+        config_dir = os.path.join(tmp, "config")
+        images_dir = os.path.join(tmp, "images")
+        os.makedirs(config_dir, exist_ok=True)
+        os.makedirs(images_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, "test.json")
+        with open(config_path, "w") as f:
+            json.dump(config_data, f)
+        return config_path, images_dir
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_known_keys_processed(self, mock_flash):
+        """Standard TFA/KERNEL keys are passed through via ATOC_KEY_MAP."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "DEVICE": {"partNumber": "AE722F80F55D5AS"},
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+                "KERNEL": {"binary": "xipImage", "mramAddress": "0x80020000"},
+            }
+            config_path, images_dir = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            mock_flash.assert_called_once()
+            call_args = mock_flash.call_args
+            assert images_dir == call_args[0][0]
+            components = call_args[0][1]
+            assert "tfa" in components
+            assert "kernel" in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_nonstandard_key_processed(self, mock_flash):
+        """Non-standard keys like OSPI_HDR are processed generically."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "DEVICE": {"partNumber": "AE722F80F55D5AS"},
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+                "OSPI_HDR": {"binary": "ospi_header.bin", "mramAddress": "0x80001000"},
+            }
+            config_path, images_dir = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            mock_flash.assert_called_once()
+            components = mock_flash.call_args[0][1]
+            assert "tfa" in components
+            assert "ospi_hdr" in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_nonstandard_key_in_mram_layout(self, mock_flash):
+        """Non-standard keys get injected into MRAM_LAYOUT with correct addr/file."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "OSPI_HDR": {"binary": "ospi_header.bin", "mramAddress": "0x80001000"},
+                "TESTDATA": {"binary": "test.bin", "mramAddress": "0x80500000"},
+            }
+            config_path, images_dir = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "ospi_hdr" in components
+            assert "testdata" in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_nonstandard_key_cleaned_up(self, mock_flash):
+        """Non-standard keys are removed from MRAM_LAYOUT after flash."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "OSPI_HDR": {"binary": "ospi_header.bin", "mramAddress": "0x80001000"},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            assert "ospi_hdr" not in MRAM_LAYOUT
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_disabled_entry_skipped(self, mock_flash):
+        """Entries with disabled=true are skipped."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+                "OSPI_HDR": {"binary": "ospi.bin", "mramAddress": "0x80001000",
+                             "disabled": True},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "tfa" in components
+            assert "ospi_hdr" not in components
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_device_key_skipped(self, mock_flash):
+        """DEVICE key is always skipped (not an image entry)."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "DEVICE": {"partNumber": "AE722F80F55D5AS"},
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "device" not in components
+            assert len(components) == 1
+
+    def test_empty_config_returns_error(self):
+        """Config with no valid image entries returns error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {"DEVICE": {"partNumber": "AE722F80F55D5AS"}}
+            config_path, _ = self._make_config_dir(tmp, config)
+            result = flash_from_config(config_path)
+            assert result["success"] is False
+            assert "No images" in result["message"]
+
+    @patch("alif_flash.jlink.flash_images")
+    def test_entry_without_mram_address_skipped(self, mock_flash):
+        """Entries missing mramAddress are skipped."""
+        mock_flash.return_value = {"success": True}
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
+                "METADATA": {"binary": "meta.bin"},  # no mramAddress
+            }
+            config_path, _ = self._make_config_dir(tmp, config)
+            flash_from_config(config_path)
+            components = mock_flash.call_args[0][1]
+            assert "tfa" in components
+            assert "metadata" not in components

@@ -63,4 +63,4 @@ Requires PRG_USB cable connected to Alif E7 AppKit.
 python3 -m pytest tests/ -v
 ```
 
-33 tests: ISP protocol (checksum, framing, parsing) + J-Link (output parsing, layout, setup).
+44 tests: ISP protocol (checksum, framing, parsing) + J-Link (output parsing, layout, setup, config parsing).

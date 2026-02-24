@@ -269,7 +269,8 @@ def flash_from_config(config_path: str, verify: bool = False) -> dict:
     """Flash images defined in an ATOC JSON config via J-Link.
 
     Reads the same JSON format as the SE-UART flash tool, extracting
-    file names and MRAM addresses from each entry.
+    file names and MRAM addresses from each entry. Handles ANY config
+    key with mramAddress + binary fields, not just known keys.
     """
     import json
 
@@ -279,17 +280,20 @@ def flash_from_config(config_path: str, verify: bool = False) -> dict:
     build_dir = os.path.normpath(os.path.join(os.path.dirname(config_path), ".."))
     images_dir = os.path.join(build_dir, "images")
 
-    # Build component list from config
+    # Build component list from config — process ALL keys generically
     components = []
     custom_layout = {}
-    for key, comp in ATOC_KEY_MAP.items():
-        entry = config.get(key, {})
+    for key, entry in config.items():
+        if key == "DEVICE" or not isinstance(entry, dict):
+            continue
         if entry.get("disabled", False):
             continue
         binary = entry.get("binary")
         addr_str = entry.get("mramAddress")
         if binary and addr_str:
             addr = int(addr_str, 16)
+            # Use ATOC_KEY_MAP for known keys, lowercased key for others
+            comp = ATOC_KEY_MAP.get(key, key.lower())
             custom_layout[comp] = {"file": binary, "addr": addr}
             components.append(comp)
 
