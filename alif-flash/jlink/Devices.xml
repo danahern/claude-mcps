@@ -19,10 +19,10 @@
   <Device>
     <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_M55_HP"
               Core="JLINK_CORE_CORTEX_M55"
-              WorkRAMAddr="0x20000000" WorkRAMSize="0x20000"
+              WorkRAMAddr="0x00000000" WorkRAMSize="0x40000"
               JLinkScriptFile="AlifE7.JLinkScript" />
     <FlashBankInfo Name="OSPI1 Flash" BaseAddr="0xC0000000" AlwaysPresent="1">
-      <LoaderInfo Name="Default" MaxSize="0x4000000"
+      <LoaderInfo Name="Default" MaxSize="0x2000000"
                   Loader="Ensemble_IS25WX256.FLM"
                   LoaderType="FLASH_ALGO_TYPE_OPEN" />
     </FlashBankInfo>
