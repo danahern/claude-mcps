@@ -12,15 +12,17 @@
   address range through the flash algorithm (handles erase/program).
   The FLM must be installed separately from Segger's Alif device pack.
 
-  The JLinkScript prevents reset during loadbin — the SE controls
-  the boot sequence and resetting via SWD kills AP[3] (M55_HP).
+  The JLinkScript (AlifE7.JLinkScript) prevents reset during loadbin —
+  the SE controls the boot sequence and resetting via SWD kills AP[3]
+  (M55_HP). JLink V9.20 doesn't resolve JLinkScriptFile paths in
+  Devices.xml correctly, so the script is passed via -JLinkScriptFile
+  on the command line instead.
 -->
 <Database>
   <Device>
     <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_M55_HP"
               Core="JLINK_CORE_CORTEX_M55"
-              WorkRAMAddr="0x00000000" WorkRAMSize="0x40000"
-              JLinkScriptFile="AlifE7.JLinkScript" />
+              WorkRAMAddr="0x00000000" WorkRAMSize="0x40000" />
     <FlashBankInfo Name="OSPI1 Flash" BaseAddr="0xC0000000" AlwaysPresent="1">
       <LoaderInfo Name="Default" MaxSize="0x2000000"
                   Loader="Ensemble_IS25WX256.FLM"

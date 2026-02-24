@@ -37,6 +37,7 @@ SPEED = 4000
 JLINK_DEVICES_DIR = os.path.expanduser(
     "~/Library/Application Support/SEGGER/JLinkDevices/AlifSemi"
 )
+JLINK_SCRIPT_FILE = os.path.join(JLINK_DEVICES_DIR, "AlifE7.JLinkScript")
 
 # MRAM layout (appkit-e7.conf, devkit-ex-b0 branch)
 MRAM_LAYOUT = {
@@ -132,12 +133,16 @@ def _run_jlink(script_content: str, timeout: int = 120) -> dict:
         script_path = f.name
 
     try:
+        cmd = [JLINK_EXE, "-device", DEVICE, "-if", INTERFACE,
+               "-speed", str(SPEED), "-autoconnect", "1",
+               "-NoGui", "1",
+               "-CommandFile", script_path]
+        # JLink V9.20 doesn't resolve JLinkScriptFile from Devices.xml
+        # correctly — pass it explicitly on the command line.
+        if os.path.exists(JLINK_SCRIPT_FILE):
+            cmd.extend(["-JLinkScriptFile", JLINK_SCRIPT_FILE])
         result = subprocess.run(
-            [JLINK_EXE, "-device", DEVICE, "-if", INTERFACE,
-             "-speed", str(SPEED), "-autoconnect", "1",
-             "-NoGui", "1",
-             "-CommandFile", script_path],
-            capture_output=True, text=True, timeout=timeout,
+            cmd, capture_output=True, text=True, timeout=timeout,
         )
         stdout = result.stdout
 
