@@ -142,7 +142,7 @@ def wait_for_replug(timeout_disappear: float = 30, timeout_total: float = 60) ->
     return None
 
 
-def reset_via_jlink(device: str = "Cortex-A32", interface: str = "SWD",
+def reset_via_jlink(device: str | None = None, interface: str = "SWD",
                     speed: int = 4000) -> dict:
     """Reset the board via JLink, triggering SE boot sequence.
 
@@ -150,9 +150,13 @@ def reset_via_jlink(device: str = "Cortex-A32", interface: str = "SWD",
     ISP-responsive mode after the reset. JLink may report "Failed to halt
     CPU" which is expected — we only need the reset, not halting.
     """
-    jlink = "/usr/local/bin/JLinkExe"
-    if not os.path.exists(jlink):
-        return {"success": False, "message": "JLinkExe not found at /usr/local/bin/JLinkExe"}
+    from .jlink import JLINK_EXE, DEVICE_RESET
+
+    if device is None:
+        device = DEVICE_RESET
+
+    if not os.path.exists(JLINK_EXE):
+        return {"success": False, "message": f"JLinkExe not found at {JLINK_EXE}"}
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.jlink', delete=False) as f:
         f.write("r\nsleep 100\nexit\n")
@@ -160,7 +164,7 @@ def reset_via_jlink(device: str = "Cortex-A32", interface: str = "SWD",
 
     try:
         result = subprocess.run(
-            [jlink, "-device", device, "-if", interface, "-speed", str(speed),
+            [JLINK_EXE, "-device", device, "-if", interface, "-speed", str(speed),
              "-autoconnect", "1", "-NoGui", "1", "-CommanderScript", script_path],
             capture_output=True, text=True, timeout=15,
         )

@@ -1,4 +1,4 @@
-"""MCP server for Alif E7 MRAM flash — SE-UART ISP and J-Link."""
+"""MCP server for Alif E7 flash — SE-UART ISP and J-Link (MRAM + OSPI)."""
 
 import json
 import logging
@@ -105,7 +105,7 @@ TOOLS = [
     ),
     Tool(
         name="jlink_flash",
-        description="Flash images to MRAM via J-Link loadbin (~44 KB/s, 9x faster than SE-UART). With config, flashes all entries with mramAddress+binary fields. Board must be freshly power-cycled. Auto-installs JLink device definition if needed.",
+        description="Flash images to MRAM or OSPI via J-Link loadbin. MRAM: ~44 KB/s direct write. OSPI: uses flash loader (slower, erase cycles). Config entries use 'address', 'mramAddress', or 'ospiAddress' fields. Board must be freshly power-cycled. Auto-installs JLink device definition if needed.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -132,7 +132,7 @@ TOOLS = [
     ),
     Tool(
         name="jlink_setup",
-        description="Check or install J-Link device definition for Alif E7 MRAM programming. Run once before using jlink_flash.",
+        description="Check or install J-Link device definition for Alif E7 (MRAM + OSPI). Reports OSPI flash loader status. Run once before using jlink_flash.",
         inputSchema={
             "type": "object",
             "properties": {

@@ -1,8 +1,15 @@
-"""J-Link MRAM programming for Alif E7.
+"""J-Link flash programming for Alif E7 (MRAM + OSPI).
 
-Direct loadbin writes via JLinkExe at ~44 KB/s (9x faster than SE-UART).
+Direct loadbin writes via JLinkExe. MRAM writes are direct (~44 KB/s).
+OSPI writes go through the Ensemble_IS25WX256.FLM flash loader (slower
+due to erase cycles). Both use the same loadbin command — J-Link routes
+writes to OSPI addresses (>= 0xC0000000) through the flash algorithm
+automatically via the FlashBankInfo in Devices.xml.
+
 Requires one-time setup: Devices.xml + AlifE7.JLinkScript installed to
 ~/Library/Application Support/SEGGER/JLinkDevices/AlifSemi/.
+For OSPI: Ensemble_IS25WX256.FLM must also be present (from Segger's
+Alif device pack).
 """
 
 import logging
@@ -16,7 +23,13 @@ import time
 logger = logging.getLogger(__name__)
 
 JLINK_EXE = "/usr/local/bin/JLinkExe"
+
+# M55_HP for loadbin (MRAM/OSPI access). Our JLinkScript blocks reset on this core.
 DEVICE = "AE722F80F55D5_M55_HP"
+# Cortex-A32 for board reset. Generic name — triggers real reset via SE boot sequence.
+# Must NOT use M55_HP here, as the JLinkScript would block the reset.
+DEVICE_RESET = "Cortex-A32"
+
 INTERFACE = "SWD"
 SPEED = 4000
 
@@ -42,27 +55,45 @@ def _jlink_data_dir() -> str:
     return os.path.join(os.path.dirname(__file__), "..", "..", "jlink")
 
 
+OSPI_FLM_NAME = "Ensemble_IS25WX256.FLM"
+
+# Addresses at or above this threshold are routed through the flash loader
+OSPI_ADDR_THRESHOLD = 0xA0000000
+
+
 def check_setup() -> dict:
     """Check if JLinkExe and device definition are installed."""
     issues = []
+    warnings = []
 
     if not os.path.exists(JLINK_EXE):
         issues.append(f"JLinkExe not found at {JLINK_EXE}")
 
     xml_path = os.path.join(JLINK_DEVICES_DIR, "Devices.xml")
     script_path = os.path.join(JLINK_DEVICES_DIR, "AlifE7.JLinkScript")
+    flm_path = os.path.join(JLINK_DEVICES_DIR, OSPI_FLM_NAME)
 
     if not os.path.exists(xml_path):
         issues.append(f"Devices.xml not found at {xml_path}")
     if not os.path.exists(script_path):
         issues.append(f"AlifE7.JLinkScript not found at {script_path}")
 
-    return {
+    if not os.path.exists(flm_path):
+        warnings.append(
+            f"OSPI flash loader ({OSPI_FLM_NAME}) not found at {flm_path}. "
+            "MRAM programming works without it. For OSPI support, install "
+            "from Segger's Alif Ensemble device pack."
+        )
+
+    result = {
         "ready": len(issues) == 0,
         "jlink_exe": JLINK_EXE,
         "device_dir": JLINK_DEVICES_DIR,
         "issues": issues,
     }
+    if warnings:
+        result["warnings"] = warnings
+    return result
 
 
 def install_device_def() -> dict:
@@ -79,7 +110,17 @@ def install_device_def() -> dict:
         shutil.copy2(src, dst)
         copied.append(name)
 
-    return {"success": True, "installed": copied, "dest": JLINK_DEVICES_DIR}
+    result = {"success": True, "installed": copied, "dest": JLINK_DEVICES_DIR}
+
+    flm_path = os.path.join(JLINK_DEVICES_DIR, OSPI_FLM_NAME)
+    if not os.path.exists(flm_path):
+        result["note"] = (
+            f"OSPI flash loader ({OSPI_FLM_NAME}) not found. "
+            "MRAM programming works without it. For OSPI support, install "
+            "from Segger's Alif Ensemble device pack."
+        )
+
+    return result
 
 
 def _run_jlink(script_content: str, timeout: int = 120) -> dict:
@@ -221,8 +262,12 @@ def flash_images(image_dir: str, components: list[str] | None = None,
             size = os.path.getsize(orig_path)
             logger.info("  %-10s %s @ 0x%08X (%d bytes)", comp, os.path.basename(orig_path), addr, size)
 
+        # OSPI flash programming is slower (erase cycles) — use longer timeout
+        has_ospi = any(addr >= OSPI_ADDR_THRESHOLD for _, _, _, addr in load_files)
+        timeout = 600 if has_ospi else 300
+
         t0 = time.time()
-        result = _run_jlink(script, timeout=300)
+        result = _run_jlink(script, timeout=timeout)
         elapsed = time.time() - t0
 
         if not result["success"]:
@@ -289,7 +334,7 @@ def flash_from_config(config_path: str, verify: bool = False) -> dict:
         if entry.get("disabled", False):
             continue
         binary = entry.get("binary")
-        addr_str = entry.get("mramAddress")
+        addr_str = entry.get("address") or entry.get("mramAddress") or entry.get("ospiAddress")
         if binary and addr_str:
             addr = int(addr_str, 16)
             # Use ATOC_KEY_MAP for known keys, lowercased key for others
