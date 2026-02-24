@@ -19,6 +19,10 @@ impl KnowledgeDb {
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Failed to open database: {}", e))?;
 
+        // WAL mode allows concurrent reads during writes (multiple instances share this DB)
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+            .map_err(|e| format!("Failed to set pragmas: {}", e))?;
+
         let db = Self { conn };
         db.create_tables()?;
         Ok(db)
@@ -359,18 +363,34 @@ impl KnowledgeDb {
     pub fn rebuild(&self, items: &[KnowledgeItem]) -> Result<(), String> {
         info!("Rebuilding index with {} items", items.len());
 
-        self.conn.execute("DELETE FROM items_fts", [])
-            .map_err(|e| format!("Failed to clear FTS: {}", e))?;
-        self.conn.execute("DELETE FROM items", [])
-            .map_err(|e| format!("Failed to clear items: {}", e))?;
+        self.conn.execute("BEGIN", [])
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        for item in items {
-            let hash = compute_item_hash(item);
-            self.index_item(item, &hash)?;
+        let result = (|| {
+            self.conn.execute("DELETE FROM items_fts", [])
+                .map_err(|e| format!("Failed to clear FTS: {}", e))?;
+            self.conn.execute("DELETE FROM items", [])
+                .map_err(|e| format!("Failed to clear items: {}", e))?;
+
+            for item in items {
+                let hash = compute_item_hash(item);
+                self.index_item(item, &hash)?;
+            }
+            Ok(())
+        })();
+
+        match &result {
+            Ok(()) => {
+                self.conn.execute("COMMIT", [])
+                    .map_err(|e| format!("Failed to commit: {}", e))?;
+                info!("Index rebuilt with {} items", items.len());
+            }
+            Err(_) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+            }
         }
 
-        info!("Index rebuilt with {} items", items.len());
-        Ok(())
+        result
     }
 
     /// Get items filtered by category.

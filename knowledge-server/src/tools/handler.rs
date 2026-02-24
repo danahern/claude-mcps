@@ -763,10 +763,15 @@ pub fn snippet(body: &str) -> String {
         return first_sentence.trim().to_string();
     }
 
-    // Truncate at word boundary
-    let truncated = &first_sentence[..150];
-    let last_space = truncated.rfind(' ').unwrap_or(150);
-    format!("{}...", &truncated[..last_space].trim())
+    // Truncate at word boundary, respecting UTF-8 char boundaries
+    let truncate_at = first_sentence.char_indices()
+        .take_while(|(i, _)| *i <= 150)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let truncated = &first_sentence[..truncate_at];
+    let last_space = truncated.rfind(' ').unwrap_or(truncate_at);
+    format!("{}...", first_sentence[..last_space].trim())
 }
 
 /// Infer a topic name from a knowledge item's file patterns and scope.
