@@ -366,7 +366,7 @@ class TestFlashFromConfig:
             injected_addr = []
             original_flash = mock_flash.side_effect
 
-            def capture_layout(images_dir, components, verify=False):
+            def capture_layout(images_dir, components, verify=False, erase=False):
                 injected_addr.append(MRAM_LAYOUT["kernel"]["addr"])
                 return {"success": True}
 

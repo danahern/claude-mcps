@@ -31,7 +31,7 @@ DEVICE = "AE722F80F55D5_M55_HP"
 DEVICE_RESET = "Cortex-A32"
 
 INTERFACE = "SWD"
-SPEED = 4000
+SPEED = "auto"
 
 # SEGGER user device directory (macOS)
 JLINK_DEVICES_DIR = os.path.expanduser(
@@ -60,6 +60,9 @@ OSPI_FLM_NAME = "Ensemble_IS25WX256.FLM"
 
 # Addresses at or above this threshold are routed through the flash loader
 OSPI_ADDR_THRESHOLD = 0xA0000000
+
+# OSPI flash erase sector size (IS25WX256/512 use 64KB sectors)
+OSPI_ERASE_SECTOR = 0x10000
 
 
 def check_setup() -> dict:
@@ -195,7 +198,7 @@ def _parse_loadbin_output(stdout: str) -> list[dict]:
 
 
 def flash_images(image_dir: str, components: list[str] | None = None,
-                 verify: bool = False) -> dict:
+                 verify: bool = False, erase: bool = False) -> dict:
     """Flash Linux images to MRAM via JLinkExe loadbin.
 
     Args:
@@ -203,6 +206,8 @@ def flash_images(image_dir: str, components: list[str] | None = None,
         components: List of components to flash (tfa, dtb, kernel, rootfs).
                     Defaults to all.
         verify: Run verifybin after each loadbin.
+        erase: Erase OSPI flash region before programming. Clears stale data
+               that MTD partition parsers (RedBoot/AFS) might misinterpret.
     """
     # Auto-install device definition if needed
     setup = check_setup()
@@ -249,6 +254,21 @@ def flash_images(image_dir: str, components: list[str] | None = None,
     try:
         # Build JLink command script
         lines = []
+
+        # Pre-erase OSPI region to clear stale partition table data
+        if erase:
+            ospi_files = [(comp, lp, op, addr) for comp, lp, op, addr in load_files
+                          if addr >= OSPI_ADDR_THRESHOLD]
+            if ospi_files:
+                # Erase from lowest OSPI addr to end of highest file, rounded up to sector boundary
+                min_addr = min(addr for _, _, _, addr in ospi_files)
+                max_end = max(addr + os.path.getsize(op) for _, _, op, addr in ospi_files)
+                erase_end = ((max_end + OSPI_ERASE_SECTOR - 1) // OSPI_ERASE_SECTOR) * OSPI_ERASE_SECTOR
+                logger.info("Pre-erasing OSPI region 0x%08X - 0x%08X (%d KB)",
+                            min_addr, erase_end, (erase_end - min_addr) // 1024)
+                lines.append(f"erase 0x{min_addr:08X} 0x{erase_end:08X}")
+                lines.append("")
+
         for comp, load_path, orig_path, addr in load_files:
             lines.append(f"loadbin {load_path} 0x{addr:08X}")
         if verify:
@@ -267,9 +287,13 @@ def flash_images(image_dir: str, components: list[str] | None = None,
             size = os.path.getsize(orig_path)
             logger.info("  %-10s %s @ 0x%08X (%d bytes)", comp, os.path.basename(orig_path), addr, size)
 
-        # OSPI flash programming is slower (erase cycles) — use longer timeout
+        # OSPI flash programming is ~7 KB/s (erase cycles) — scale timeout to data size
         has_ospi = any(addr >= OSPI_ADDR_THRESHOLD for _, _, _, addr in load_files)
-        timeout = 600 if has_ospi else 300
+        if has_ospi:
+            # ~7 KB/s + overhead for erase/verify. 2x safety margin.
+            timeout = max(600, (total_bytes // 3500) * 2)
+        else:
+            timeout = 300
 
         t0 = time.time()
         result = _run_jlink(script, timeout=timeout)
@@ -315,7 +339,8 @@ def flash_images(image_dir: str, components: list[str] | None = None,
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def flash_from_config(config_path: str, verify: bool = False) -> dict:
+def flash_from_config(config_path: str, verify: bool = False,
+                      erase: bool = False) -> dict:
     """Flash images defined in an ATOC JSON config via J-Link.
 
     Reads the same JSON format as the SE-UART flash tool, extracting
@@ -357,7 +382,7 @@ def flash_from_config(config_path: str, verify: bool = False) -> dict:
         MRAM_LAYOUT[comp] = info
 
     try:
-        return flash_images(images_dir, components, verify)
+        return flash_images(images_dir, components, verify, erase)
     finally:
         for comp, orig in saved.items():
             if orig is not None:

@@ -127,6 +127,11 @@ TOOLS = [
                     "description": "Verify after programming (default: false)",
                     "default": False,
                 },
+                "erase": {
+                    "type": "boolean",
+                    "description": "Pre-erase OSPI region before programming. Clears stale data that kernel MTD partition parsers might misinterpret. Only affects OSPI addresses. (default: false)",
+                    "default": False,
+                },
             },
         },
     ),
@@ -140,6 +145,32 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Install device definition if not present (default: false, just check)",
                     "default": False,
+                },
+            },
+        },
+    ),
+    Tool(
+        name="ospi_program",
+        description="Program OSPI flash via RTT (~500 KB/s). Requires OSPI programmer firmware loaded via ATOC config. Use jlink_flash for FLM fallback (~7 KB/s).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "string",
+                    "description": "ATOC JSON config with OSPI addresses (entries with 'address' >= 0xC0000000).",
+                },
+                "image": {
+                    "type": "string",
+                    "description": "Single image file path (alternative to config).",
+                },
+                "address": {
+                    "type": "string",
+                    "description": "OSPI address for single image (e.g. '0xC0000000'). Required with 'image'.",
+                },
+                "verify": {
+                    "type": "boolean",
+                    "description": "Verify CRC32 after programming (default: true)",
+                    "default": True,
                 },
             },
         },
@@ -200,6 +231,32 @@ def _resolve_port(args: dict) -> str:
     # Prefer FTDI (usbserial) over JLink VCOM (usbmodem)
     ftdi = [p for p in ports if "usbserial" in p]
     return ftdi[0] if ftdi else ports[0]
+
+
+def _ospi_program_single(data: bytes, addr: int, verify: bool) -> dict:
+    """Program a single image via RTT."""
+    from . import ospi_rtt
+    import pylink
+    import time
+
+    jlink = pylink.JLink()
+    try:
+        jlink.open()
+        jlink.connect(ospi_rtt.DEVICE, verbose=True)
+        jlink.rtt_start()
+        time.sleep(0.5)  # Wait for RTT control block
+
+        programmer = ospi_rtt.OspiProgrammer(jlink)
+        version = programmer.ping()
+        result = programmer.flash_image(addr, data, verify=verify)
+        result["firmware_version"] = version
+        return result
+    finally:
+        try:
+            jlink.rtt_stop()
+        except Exception:
+            pass
+        jlink.close()
 
 
 def create_server(setools_dir: str | None = None) -> Server:
@@ -271,18 +328,19 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
             from . import jlink
             config = args.get("config")
             verify = args.get("verify", False)
+            erase = args.get("erase", False)
             if config:
                 if not os.path.isabs(config) and setools_dir:
                     config = os.path.join(setools_dir, config)
                 result = await asyncio.to_thread(
-                    jlink.flash_from_config, config, verify)
+                    jlink.flash_from_config, config, verify, erase)
             else:
                 image_dir = args.get("image_dir", "")
                 if not image_dir:
                     return _text("Error: provide either 'image_dir' or 'config'")
                 components = args.get("components")
                 result = await asyncio.to_thread(
-                    jlink.flash_images, image_dir, components, verify)
+                    jlink.flash_images, image_dir, components, verify, erase)
             return _json(result)
 
         case "jlink_setup":
@@ -291,6 +349,27 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
                 result = await asyncio.to_thread(jlink.install_device_def)
             else:
                 result = jlink.check_setup()
+            return _json(result)
+
+        case "ospi_program":
+            from . import ospi_rtt
+            config = args.get("config")
+            image = args.get("image")
+            address = args.get("address")
+            verify = args.get("verify", True)
+            if config:
+                if not os.path.isabs(config) and setools_dir:
+                    config = os.path.join(setools_dir, config)
+                result = await asyncio.to_thread(
+                    ospi_rtt.connect_and_program, config, verify)
+            elif image and address:
+                addr = int(address, 16) if isinstance(address, str) else address
+                with open(image, "rb") as f:
+                    data = f.read()
+                result = await asyncio.to_thread(
+                    _ospi_program_single, data, addr, verify)
+            else:
+                return _text("Error: provide 'config' or both 'image' and 'address'")
             return _json(result)
 
         case "monitor":
