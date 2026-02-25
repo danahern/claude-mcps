@@ -10,6 +10,7 @@ from alif_flash.jlink import (
     ATOC_KEY_MAP,
     OSPI_ADDR_THRESHOLD,
     OSPI_FLM_NAME,
+    JLINK_SCRIPT_FILE,
     _parse_loadbin_output,
     check_setup,
     flash_from_config,
@@ -365,7 +366,7 @@ class TestFlashFromConfig:
             injected_addr = []
             original_flash = mock_flash.side_effect
 
-            def capture_layout(images_dir, components, verify=False):
+            def capture_layout(images_dir, components, verify=False, erase=False):
                 injected_addr.append(MRAM_LAYOUT["kernel"]["addr"])
                 return {"success": True}
 
@@ -461,3 +462,8 @@ class TestOspiConstants:
             assert info["addr"] < OSPI_ADDR_THRESHOLD, (
                 f"{comp} addr 0x{info['addr']:08X} >= OSPI threshold"
             )
+
+    def test_jlink_script_file_path(self):
+        """JLINK_SCRIPT_FILE should be in the devices directory."""
+        assert JLINK_SCRIPT_FILE.endswith("AlifE7.JLinkScript")
+        assert JLINK_DEVICES_DIR in JLINK_SCRIPT_FILE
