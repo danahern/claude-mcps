@@ -57,7 +57,9 @@ MAX_WRITE_CHUNK = 4096
 SECTOR_SIZE = 0x10000  # 64KB
 OSPI_XIP_BASE = 0xC0000000
 
-DEVICE = "AE722F80F55D5_M55_HP"
+# Backward-compatible default (alif-e7)
+from . import devices as _devices
+DEVICE = _devices.get_config()["jlink_device"]
 RTT_TIMEOUT = 5.0  # seconds
 
 
@@ -333,12 +335,15 @@ class OspiProgrammer:
         }
 
 
-def connect_and_program(config_path, verify=True):
+def connect_and_program(config_path, verify=True, device=None):
     """Convenience: connect JLink, start RTT, program, close.
 
     Returns results dict.
     """
     import pylink
+
+    cfg = _devices.get_config(device)
+    jlink_device = cfg["jlink_device"]
 
     jlink = pylink.JLink()
     try:
@@ -354,7 +359,7 @@ def connect_and_program(config_path, verify=True):
             raise OspiProgrammerError(
                 f"J-Link open failed (found {len(emulators)} emulator(s), "
                 f"serial={emulators[0].SerialNumber})")
-        jlink.connect(DEVICE, verbose=True)
+        jlink.connect(jlink_device, verbose=True)
         jlink.rtt_start()
 
         # Wait for RTT control block

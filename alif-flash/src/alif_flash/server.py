@@ -1,4 +1,4 @@
-"""MCP server for Alif E7 flash — SE-UART ISP and J-Link (MRAM + OSPI)."""
+"""MCP server for Alif Ensemble flash — SE-UART ISP and J-Link (MRAM + OSPI)."""
 
 import json
 import logging
@@ -10,6 +10,11 @@ from mcp.types import TextContent, Tool
 
 logger = logging.getLogger(__name__)
 
+_DEVICE_PROPERTY = {
+    "type": "string",
+    "description": "Target device (default: alif-e7). Available: alif-e7, alif-e8.",
+    "default": "alif-e7",
+}
 
 TOOLS = [
     Tool(
@@ -17,7 +22,9 @@ TOOLS = [
         description="List available SE-UART serial ports (/dev/cu.usbmodem*).",
         inputSchema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "device": _DEVICE_PROPERTY,
+            },
         },
     ),
     Tool(
@@ -30,6 +37,7 @@ TOOLS = [
                     "type": "string",
                     "description": "Serial port path. Auto-detected if omitted.",
                 },
+                "device": _DEVICE_PROPERTY,
             },
         },
     ),
@@ -53,6 +61,7 @@ TOOLS = [
                     "description": "Wait for manual USB unplug/replug before sending ISP commands",
                     "default": False,
                 },
+                "device": _DEVICE_PROPERTY,
             },
         },
     ),
@@ -66,6 +75,7 @@ TOOLS = [
                     "type": "string",
                     "description": "Config path relative to setools_dir (e.g. 'build/config/linux-boot-e7.json')",
                 },
+                "device": _DEVICE_PROPERTY,
             },
             "required": ["config"],
         },
@@ -99,6 +109,7 @@ TOOLS = [
                     "description": "Wait for manual USB unplug/replug before entering maintenance. Requires maintenance=true.",
                     "default": False,
                 },
+                "device": _DEVICE_PROPERTY,
             },
             "required": ["config"],
         },
@@ -132,12 +143,13 @@ TOOLS = [
                     "description": "Pre-erase OSPI region before programming. Clears stale data that kernel MTD partition parsers might misinterpret. Only affects OSPI addresses. (default: false)",
                     "default": False,
                 },
+                "device": _DEVICE_PROPERTY,
             },
         },
     ),
     Tool(
         name="jlink_setup",
-        description="Check or install J-Link device definition for Alif E7 (MRAM + OSPI). Reports OSPI flash loader status. Run once before using jlink_flash.",
+        description="Check or install J-Link device definition for Alif Ensemble (MRAM + OSPI). Reports OSPI flash loader status. Run once before using jlink_flash.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -146,6 +158,7 @@ TOOLS = [
                     "description": "Install device definition if not present (default: false, just check)",
                     "default": False,
                 },
+                "device": _DEVICE_PROPERTY,
             },
         },
     ),
@@ -172,6 +185,7 @@ TOOLS = [
                     "description": "Verify CRC32 after programming (default: true)",
                     "default": True,
                 },
+                "device": _DEVICE_PROPERTY,
             },
         },
     ),
@@ -200,6 +214,7 @@ TOOLS = [
                     "description": "Wait for board unplug/replug before reading (captures boot output)",
                     "default": False,
                 },
+                "device": _DEVICE_PROPERTY,
             },
         },
     ),
@@ -233,19 +248,22 @@ def _resolve_port(args: dict) -> str:
     return ftdi[0] if ftdi else ports[0]
 
 
-def _ospi_program_single(data: bytes, addr: int, verify: bool) -> dict:
+def _ospi_program_single(data: bytes, addr: int, verify: bool,
+                         device: str | None = None) -> dict:
     """Program a single image via RTT."""
-    from . import ospi_rtt
+    from . import devices
     import pylink
     import time
 
+    cfg = devices.get_config(device)
     jlink = pylink.JLink()
     try:
         jlink.open()
-        jlink.connect(ospi_rtt.DEVICE, verbose=True)
+        jlink.connect(cfg["jlink_device"], verbose=True)
         jlink.rtt_start()
         time.sleep(0.5)  # Wait for RTT control block
 
+        from . import ospi_rtt
         programmer = ospi_rtt.OspiProgrammer(jlink)
         version = programmer.ping()
         result = programmer.flash_image(addr, data, verify=verify)
@@ -281,6 +299,8 @@ def create_server(setools_dir: str | None = None) -> Server:
 async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[TextContent]:
     import asyncio
     from . import isp
+
+    device = args.get("device")
 
     match name:
         case "list_ports":
@@ -320,7 +340,8 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
             wait_replug = args.get("wait_for_replug", False)
             result = await asyncio.to_thread(
                 isp.flash_images, port, config_path, enter_maint,
-                do_wait_for_replug=wait_replug, jlink_reset=jlink_reset
+                do_wait_for_replug=wait_replug, jlink_reset=jlink_reset,
+                device=device
             )
             return _json(result)
 
@@ -333,22 +354,25 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
                 if not os.path.isabs(config) and setools_dir:
                     config = os.path.join(setools_dir, config)
                 result = await asyncio.to_thread(
-                    jlink.flash_from_config, config, verify, erase)
+                    jlink.flash_from_config, config, verify, erase,
+                    device=device)
             else:
                 image_dir = args.get("image_dir", "")
                 if not image_dir:
                     return _text("Error: provide either 'image_dir' or 'config'")
                 components = args.get("components")
                 result = await asyncio.to_thread(
-                    jlink.flash_images, image_dir, components, verify, erase)
+                    jlink.flash_images, image_dir, components, verify, erase,
+                    device=device)
             return _json(result)
 
         case "jlink_setup":
             from . import jlink
             if args.get("install", False):
-                result = await asyncio.to_thread(jlink.install_device_def)
+                result = await asyncio.to_thread(
+                    jlink.install_device_def, device=device)
             else:
-                result = jlink.check_setup()
+                result = jlink.check_setup(device=device)
             return _json(result)
 
         case "ospi_program":
@@ -361,13 +385,15 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
                 if not os.path.isabs(config) and setools_dir:
                     config = os.path.join(setools_dir, config)
                 result = await asyncio.to_thread(
-                    ospi_rtt.connect_and_program, config, verify)
+                    ospi_rtt.connect_and_program, config, verify,
+                    device=device)
             elif image and address:
                 addr = int(address, 16) if isinstance(address, str) else address
                 with open(image, "rb") as f:
                     data = f.read()
                 result = await asyncio.to_thread(
-                    _ospi_program_single, data, addr, verify)
+                    _ospi_program_single, data, addr, verify,
+                    device=device)
             else:
                 return _text("Error: provide 'config' or both 'image' and 'address'")
             return _json(result)

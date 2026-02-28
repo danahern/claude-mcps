@@ -106,6 +106,77 @@ fn make_error(msg: impl Into<String>) -> McpError {
     McpError::internal_error(msg.into(), None)
 }
 
+/// Check if an Alif E7 Yocto build has MX_FLASH_EN misconfigured.
+///
+/// When OSPI_BOOT=1 and MX_FLASH_EN is not explicitly "0", the Yocto build
+/// system applies --reverse-bytes=2 to xipImage/rootfs, byte-swapping within
+/// 16-bit halfwords. This is WRONG for IS25WX flash on the Alif E7 DevKit
+/// and causes immediate kernel crash (invalid ARM instructions).
+///
+/// Returns a warning string if misconfigured, None if OK or not an Alif build.
+async fn check_mx_flash_en(container: &str, build_dir: &str) -> Option<String> {
+    // Only check for Alif E7 builds (build dir contains "alif" or "e7")
+    if !is_alif_e7_build(build_dir) {
+        return None;
+    }
+
+    let conf_path = format!(
+        "/home/builder/yocto/{}/conf/local.conf",
+        build_dir
+    );
+    let check_cmd = format!(
+        "grep -E '^(MX_FLASH_EN|OSPI_BOOT)' {} 2>/dev/null || true",
+        conf_path
+    );
+
+    let result = docker_client::exec_command(container, &check_cmd, None).await.ok()?;
+    parse_mx_flash_en_warning(&result.stdout)
+}
+
+/// Check if a build directory name indicates an Alif build (E7 or E8).
+fn is_alif_e7_build(build_dir: &str) -> bool {
+    let dir_lower = build_dir.to_lowercase();
+    dir_lower.contains("alif") || dir_lower.contains("e7") || dir_lower.contains("e8")
+}
+
+/// Resolve Docker image from board name.
+/// Both Alif boards share the same cross-compiler (armhf Cortex-A32).
+fn image_for_board(board: &str) -> Option<&'static str> {
+    match board.to_lowercase().as_str() {
+        "stm32mp1" => Some("stm32mp1-sdk"),
+        s if s.starts_with("alif") => Some("alif-sdk"),
+        _ => None,
+    }
+}
+
+/// Parse grep output from local.conf and return a warning if MX_FLASH_EN
+/// is misconfigured (OSPI_BOOT=1 without MX_FLASH_EN="0").
+fn parse_mx_flash_en_warning(conf_output: &str) -> Option<String> {
+    let output = conf_output.trim();
+
+    let has_ospi_boot = output.lines().any(|l| {
+        l.starts_with("OSPI_BOOT") && l.contains("\"1\"")
+    });
+    let mx_flash_line = output.lines().find(|l| l.starts_with("MX_FLASH_EN"));
+    let mx_flash_safe = mx_flash_line
+        .map(|l| l.contains("\"0\""))
+        .unwrap_or(false);
+
+    if has_ospi_boot && !mx_flash_safe {
+        Some(
+            "WARNING: MX_FLASH_EN byte-swap issue detected!\n\
+             OSPI_BOOT=1 is set but MX_FLASH_EN is not explicitly \"0\" in local.conf.\n\
+             The Yocto build will apply --reverse-bytes=2 to xipImage/rootfs,\n\
+             byte-swapping within 16-bit halfwords. This is WRONG for IS25WX flash\n\
+             on the Alif E7 DevKit and causes immediate kernel crash on boot.\n\
+             Fix: Add MX_FLASH_EN = \"0\" to local.conf.\n"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Truncate output to first + last lines for large Yocto builds
 fn truncate_output(output: &str, head: usize, tail: usize) -> String {
     let lines: Vec<&str> = output.lines().collect();
@@ -127,12 +198,16 @@ impl LinuxBuildToolHandler {
     // Container Lifecycle (3 tools)
     // =========================================================================
 
-    #[tool(description = "Start a Docker build container with optional workspace mount. Returns container name for use with other tools.")]
+    #[tool(description = "Start a Docker build container with optional workspace mount. Use `board` to auto-select the right Docker image (e.g., 'alif-e7', 'alif-e8', 'stm32mp1'). Returns container name for use with other tools.")]
     async fn start_container(&self, Parameters(args): Parameters<StartContainerArgs>) -> Result<CallToolResult, McpError> {
         let name = args.name.unwrap_or_else(|| {
             format!("linux-build-{}", &uuid::Uuid::new_v4().to_string()[..8])
         });
-        let image = args.image.as_deref().unwrap_or(&self.config.docker_image);
+        // Priority: explicit image > board mapping > config default
+        let board_image = args.board.as_deref().and_then(image_for_board);
+        let image = args.image.as_deref()
+            .or(board_image)
+            .unwrap_or(&self.config.docker_image);
         let workspace = args.workspace_dir
             .as_ref()
             .map(|s| std::path::PathBuf::from(s))
@@ -465,6 +540,13 @@ impl LinuxBuildToolHandler {
 
     #[tool(description = "Run a Yocto bitbake build in a Docker container. Supports background mode for long builds.")]
     async fn yocto_build(&self, Parameters(args): Parameters<YoctoBuildArgs>) -> Result<CallToolResult, McpError> {
+        // Pre-build: check for MX_FLASH_EN byte-swap misconfiguration on Alif E7
+        let mx_flash_warning = check_mx_flash_en(&args.container, &args.build_dir).await;
+        if let Some(ref warning) = mx_flash_warning {
+            // Return error — don't waste hours on a broken build
+            return Err(make_error(warning.clone()));
+        }
+
         // Build the bitbake command
         let mut shell_cmd = format!(
             "cd /home/builder/yocto && source poky/oe-init-build-env {} > /dev/null",
@@ -1182,5 +1264,70 @@ mod tests {
         assert!(result.contains("190 lines omitted"));
         assert!(result.contains("line 195"));
         assert!(result.contains("line 199"));
+    }
+
+    // MX_FLASH_EN validation tests
+
+    #[test]
+    fn test_is_alif_e7_build() {
+        assert!(is_alif_e7_build("build-alif-e7"));
+        assert!(is_alif_e7_build("build-ALIF-E7"));
+        assert!(is_alif_e7_build("my-e7-build"));
+        assert!(is_alif_e7_build("alif-test"));
+        assert!(is_alif_e7_build("build-alif-e8"));
+        assert!(is_alif_e7_build("build-e8"));
+        assert!(!is_alif_e7_build("build-stm32mp1"));
+        assert!(!is_alif_e7_build("build"));
+    }
+
+    #[test]
+    fn test_image_for_board() {
+        assert_eq!(image_for_board("stm32mp1"), Some("stm32mp1-sdk"));
+        assert_eq!(image_for_board("alif-e7"), Some("alif-sdk"));
+        assert_eq!(image_for_board("alif-e8"), Some("alif-sdk"));
+        assert_eq!(image_for_board("ALIF-E8"), Some("alif-sdk"));
+        assert_eq!(image_for_board("unknown-board"), None);
+    }
+
+    #[test]
+    fn test_mx_flash_en_ospi_without_fix() {
+        // OSPI_BOOT=1 but no MX_FLASH_EN — should warn
+        let output = "OSPI_BOOT = \"1\"\n";
+        let result = parse_mx_flash_en_warning(output);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("MX_FLASH_EN"));
+    }
+
+    #[test]
+    fn test_mx_flash_en_ospi_with_bad_value() {
+        // OSPI_BOOT=1 and MX_FLASH_EN=1 — should warn
+        let output = "OSPI_BOOT = \"1\"\nMX_FLASH_EN = \"1\"\n";
+        let result = parse_mx_flash_en_warning(output);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("byte-swap"));
+    }
+
+    #[test]
+    fn test_mx_flash_en_ospi_with_fix() {
+        // OSPI_BOOT=1 and MX_FLASH_EN=0 — safe
+        let output = "OSPI_BOOT = \"1\"\nMX_FLASH_EN = \"0\"\n";
+        let result = parse_mx_flash_en_warning(output);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mx_flash_en_no_ospi() {
+        // No OSPI_BOOT — no warning needed
+        let output = "";
+        let result = parse_mx_flash_en_warning(output);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mx_flash_en_ospi_disabled() {
+        // OSPI_BOOT=0 — no warning needed
+        let output = "OSPI_BOOT = \"0\"\n";
+        let result = parse_mx_flash_en_warning(output);
+        assert!(result.is_none());
     }
 }

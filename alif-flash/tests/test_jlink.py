@@ -361,18 +361,11 @@ class TestFlashFromConfig:
                 },
             }
             config_path, _ = self._make_config_dir(tmp, config)
-
-            # Capture the layout injected during flash_from_config
-            injected_addr = []
-            original_flash = mock_flash.side_effect
-
-            def capture_layout(images_dir, components, verify=False, erase=False):
-                injected_addr.append(MRAM_LAYOUT["kernel"]["addr"])
-                return {"success": True}
-
-            mock_flash.side_effect = capture_layout
             flash_from_config(config_path)
-            assert injected_addr[0] == 0xC0100000
+
+            # flash_from_config passes custom layout via keyword arg
+            layout = mock_flash.call_args.kwargs.get("layout", {})
+            assert layout["kernel"]["addr"] == 0xC0100000
 
     @patch("alif_flash.jlink.flash_images")
     def test_mixed_mram_ospi_config(self, mock_flash):

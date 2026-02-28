@@ -20,15 +20,16 @@ import subprocess
 import tempfile
 import time
 
+from . import devices
+
 logger = logging.getLogger(__name__)
 
 JLINK_EXE = "/usr/local/bin/JLinkExe"
 
-# M55_HP for loadbin (MRAM/OSPI access). Our JLinkScript blocks reset on this core.
-DEVICE = "AE722F80F55D5_M55_HP"
-# Cortex-A32 for board reset. Generic name — triggers real reset via SE boot sequence.
-# Must NOT use M55_HP here, as the JLinkScript would block the reset.
-DEVICE_RESET = "Cortex-A32"
+# Backward-compatible module-level defaults (alif-e7)
+_DEFAULT_CFG = devices.get_config()
+DEVICE = _DEFAULT_CFG["jlink_device"]
+DEVICE_RESET = _DEFAULT_CFG["jlink_device_reset"]
 
 INTERFACE = "SWD"
 SPEED = "auto"
@@ -37,18 +38,13 @@ SPEED = "auto"
 JLINK_DEVICES_DIR = os.path.expanduser(
     "~/Library/Application Support/SEGGER/JLinkDevices/AlifSemi"
 )
-JLINK_SCRIPT_FILE = os.path.join(JLINK_DEVICES_DIR, "AlifE7.JLinkScript")
+JLINK_SCRIPT_FILE = os.path.join(JLINK_DEVICES_DIR, _DEFAULT_CFG["jlink_script"])
 
-# MRAM layout (appkit-e7.conf, devkit-ex-b0 branch)
-MRAM_LAYOUT = {
-    "tfa":    {"file": "bl32.bin",        "addr": 0x80002000},
-    "dtb":    {"file": "appkit-e7.dtb",   "addr": 0x80010000},
-    "kernel": {"file": "xipImage",        "addr": 0x80020000},
-    "rootfs": {"file": "cramfs-xip.img",  "addr": 0x80300000},
-}
+# MRAM layout — E7 defaults (use devices.get_config(device) for other boards)
+MRAM_LAYOUT = dict(_DEFAULT_CFG["mram_layout"])
 
 # Maps ATOC JSON keys to component names
-ATOC_KEY_MAP = {"TFA": "tfa", "DTB": "dtb", "KERNEL": "kernel", "ROOTFS": "rootfs"}
+ATOC_KEY_MAP = dict(_DEFAULT_CFG["atoc_key_map"])
 
 
 def _jlink_data_dir() -> str:
@@ -65,8 +61,9 @@ OSPI_ADDR_THRESHOLD = 0xA0000000
 OSPI_ERASE_SECTOR = 0x10000
 
 
-def check_setup() -> dict:
+def check_setup(device: str | None = None) -> dict:
     """Check if JLinkExe and device definition are installed."""
+    cfg = devices.get_config(device)
     issues = []
     warnings = []
 
@@ -74,7 +71,7 @@ def check_setup() -> dict:
         issues.append(f"JLinkExe not found at {JLINK_EXE}")
 
     xml_path = os.path.join(JLINK_DEVICES_DIR, "Devices.xml")
-    script_path = os.path.join(JLINK_DEVICES_DIR, "AlifE7.JLinkScript")
+    script_path = os.path.join(JLINK_DEVICES_DIR, cfg["jlink_script"])
     flm_path = os.path.join(JLINK_DEVICES_DIR, OSPI_FLM_NAME)
 
     if not os.path.exists(xml_path):
@@ -100,13 +97,14 @@ def check_setup() -> dict:
     return result
 
 
-def install_device_def() -> dict:
-    """Install Devices.xml + AlifE7.JLinkScript to SEGGER user directory."""
+def install_device_def(device: str | None = None) -> dict:
+    """Install Devices.xml + JLinkScript to SEGGER user directory."""
+    cfg = devices.get_config(device)
     src_dir = _jlink_data_dir()
     os.makedirs(JLINK_DEVICES_DIR, exist_ok=True)
 
     copied = []
-    for name in ("Devices.xml", "AlifE7.JLinkScript"):
+    for name in ("Devices.xml", cfg["jlink_script"]):
         src = os.path.join(src_dir, name)
         dst = os.path.join(JLINK_DEVICES_DIR, name)
         if not os.path.exists(src):
@@ -127,8 +125,12 @@ def install_device_def() -> dict:
     return result
 
 
-def _run_jlink(script_content: str, timeout: int = 120) -> dict:
+def _run_jlink(script_content: str, device: str | None = None, timeout: int = 120) -> dict:
     """Run JLinkExe with a command script. Returns parsed output."""
+    cfg = devices.get_config(device)
+    jlink_device = cfg["jlink_device"]
+    jlink_script_path = os.path.join(JLINK_DEVICES_DIR, cfg["jlink_script"])
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".jlink", delete=False
     ) as f:
@@ -136,14 +138,14 @@ def _run_jlink(script_content: str, timeout: int = 120) -> dict:
         script_path = f.name
 
     try:
-        cmd = [JLINK_EXE, "-device", DEVICE, "-if", INTERFACE,
+        cmd = [JLINK_EXE, "-device", jlink_device, "-if", INTERFACE,
                "-speed", str(SPEED), "-autoconnect", "1",
                "-NoGui", "1",
                "-CommandFile", script_path]
         # JLink V9.20 doesn't resolve JLinkScriptFile from Devices.xml
         # correctly — pass it explicitly on the command line.
-        if os.path.exists(JLINK_SCRIPT_FILE):
-            cmd.extend(["-JLinkScriptFile", JLINK_SCRIPT_FILE])
+        if os.path.exists(jlink_script_path):
+            cmd.extend(["-JLinkScriptFile", jlink_script_path])
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
         )
@@ -198,7 +200,8 @@ def _parse_loadbin_output(stdout: str) -> list[dict]:
 
 
 def flash_images(image_dir: str, components: list[str] | None = None,
-                 verify: bool = False, erase: bool = False) -> dict:
+                 verify: bool = False, erase: bool = False,
+                 device: str | None = None, layout: dict | None = None) -> dict:
     """Flash Linux images to MRAM via JLinkExe loadbin.
 
     Args:
@@ -208,29 +211,35 @@ def flash_images(image_dir: str, components: list[str] | None = None,
         verify: Run verifybin after each loadbin.
         erase: Erase OSPI flash region before programming. Clears stale data
                that MTD partition parsers (RedBoot/AFS) might misinterpret.
+        device: Target device name (default: alif-e7).
+        layout: Custom MRAM layout dict. If None, uses device's default layout.
     """
+    if layout is None:
+        cfg = devices.get_config(device)
+        layout = cfg["mram_layout"]
+
     # Auto-install device definition if needed
-    setup = check_setup()
+    setup = check_setup(device=device)
     if not setup["ready"]:
         if any("JLinkExe" in i for i in setup["issues"]):
             return {"success": False, "message": "JLinkExe not installed",
                     "issues": setup["issues"]}
         logger.info("Device definition not installed, installing...")
-        install_result = install_device_def()
+        install_result = install_device_def(device=device)
         if not install_result["success"]:
             return {"success": False, "message": "Failed to install device definition",
                     "detail": install_result}
 
     if components is None:
-        components = list(MRAM_LAYOUT.keys())
+        components = list(layout.keys())
 
     # Validate files
     files_to_flash = []
     for comp in components:
-        if comp not in MRAM_LAYOUT:
+        if comp not in layout:
             return {"success": False,
-                    "message": f"Unknown component '{comp}'. Use: {', '.join(MRAM_LAYOUT)}"}
-        info = MRAM_LAYOUT[comp]
+                    "message": f"Unknown component '{comp}'. Use: {', '.join(layout)}"}
+        info = layout[comp]
         path = os.path.join(image_dir, info["file"])
         if not os.path.exists(path):
             return {"success": False, "message": f"File not found: {path}"}
@@ -296,7 +305,7 @@ def flash_images(image_dir: str, components: list[str] | None = None,
             timeout = 300
 
         t0 = time.time()
-        result = _run_jlink(script, timeout=timeout)
+        result = _run_jlink(script, device=device, timeout=timeout)
         elapsed = time.time() - t0
 
         if not result["success"]:
@@ -340,7 +349,7 @@ def flash_images(image_dir: str, components: list[str] | None = None,
 
 
 def flash_from_config(config_path: str, verify: bool = False,
-                      erase: bool = False) -> dict:
+                      erase: bool = False, device: str | None = None) -> dict:
     """Flash images defined in an ATOC JSON config via J-Link.
 
     Reads the same JSON format as the SE-UART flash tool, extracting
@@ -349,14 +358,16 @@ def flash_from_config(config_path: str, verify: bool = False,
     """
     import json
 
+    cfg = devices.get_config(device)
+    atoc_key_map = cfg["atoc_key_map"]
+
     with open(config_path) as f:
         config = json.load(f)
 
     build_dir = os.path.normpath(os.path.join(os.path.dirname(config_path), ".."))
     images_dir = os.path.join(build_dir, "images")
 
-    # Build component list from config — process ALL keys generically
-    components = []
+    # Build layout from config — process ALL keys generically
     custom_layout = {}
     for key, entry in config.items():
         if key == "DEVICE" or not isinstance(entry, dict):
@@ -367,25 +378,11 @@ def flash_from_config(config_path: str, verify: bool = False,
         addr_str = entry.get("address") or entry.get("mramAddress") or entry.get("ospiAddress")
         if binary and addr_str:
             addr = int(addr_str, 16)
-            # Use ATOC_KEY_MAP for known keys, lowercased key for others
-            comp = ATOC_KEY_MAP.get(key, key.lower())
+            comp = atoc_key_map.get(key, key.lower())
             custom_layout[comp] = {"file": binary, "addr": addr}
-            components.append(comp)
 
-    if not components:
+    if not custom_layout:
         return {"success": False, "message": "No images found in config"}
 
-    # Override MRAM_LAYOUT temporarily with config values
-    saved = {}
-    for comp, info in custom_layout.items():
-        saved[comp] = MRAM_LAYOUT.get(comp)
-        MRAM_LAYOUT[comp] = info
-
-    try:
-        return flash_images(images_dir, components, verify, erase)
-    finally:
-        for comp, orig in saved.items():
-            if orig is not None:
-                MRAM_LAYOUT[comp] = orig
-            else:
-                del MRAM_LAYOUT[comp]
+    components = list(custom_layout.keys())
+    return flash_images(images_dir, components, verify, erase, layout=custom_layout)

@@ -12,9 +12,13 @@ pub struct StartContainerArgs {
     /// Container name (default: auto-generated)
     #[serde(default)]
     pub name: Option<String>,
-    /// Docker image override (default: from config)
+    /// Docker image override (default: from config or board mapping)
     #[serde(default)]
     pub image: Option<String>,
+    /// Board name for auto-selecting Docker image (e.g., "alif-e7", "alif-e8", "stm32mp1").
+    /// Ignored if `image` is explicitly provided.
+    #[serde(default)]
+    pub board: Option<String>,
     /// Host workspace directory to mount
     #[serde(default)]
     pub workspace_dir: Option<String>,

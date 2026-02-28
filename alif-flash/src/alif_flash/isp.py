@@ -465,9 +465,14 @@ def write_image(port: str, path: str, addr: int) -> dict:
 
 
 def flash_images(port: str, config_path: str, enter_maint: bool = False,
-                  do_wait_for_replug: bool = False, jlink_reset: bool = False) -> dict:
+                  do_wait_for_replug: bool = False, jlink_reset: bool = False,
+                  device: str | None = None) -> dict:
     """Flash ATOC package and all images defined in the ATOC JSON config."""
     import json
+    from . import devices
+
+    cfg = devices.get_config(device)
+    system_mram_base = cfg["system_mram_base"]
 
     if enter_maint:
         maint_result = enter_maintenance(
@@ -482,16 +487,12 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
 
     build_dir = os.path.normpath(os.path.join(os.path.dirname(config_path), ".."))
     images_dir = os.path.join(build_dir, "images")
-
-    # ATOC goes at end of APP MRAM, just below System MRAM base
-    # Address = System MRAM Base - ATOC file size
-    SYSTEM_MRAM_BASE = 0x80580000
     atoc_path = os.path.join(build_dir, "AppTocPackage.bin")
 
     images = []
     if os.path.exists(atoc_path):
         atoc_size = os.path.getsize(atoc_path)
-        atoc_addr = SYSTEM_MRAM_BASE - atoc_size
+        atoc_addr = system_mram_base - atoc_size
         logger.info("ATOC: %d bytes -> 0x%08X", atoc_size, atoc_addr)
         images.append((atoc_path, atoc_addr))
     else:

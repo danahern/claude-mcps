@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Alif E7 MRAM Flash MCP Server")
+    parser = argparse.ArgumentParser(description="Alif Ensemble Flash MCP Server")
     parser.add_argument(
         "--setools-dir",
         default=None,
@@ -44,7 +44,7 @@ async def _run():
     init_options = server.create_initialization_options()
 
     async with stdio_server() as (read_stream, write_stream):
-        logger.info("Alif Flash MCP server starting")
+        logger.info("Alif Ensemble Flash MCP server starting")
         await server.run(read_stream, write_stream, init_options)
 
 
