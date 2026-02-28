@@ -1,6 +1,6 @@
 # alif-flash
 
-Alif E7 flash MCP server — three methods: SE-UART ISP, J-Link loadbin, and RTT OSPI programmer.
+Alif Ensemble flash MCP server — supports E7 and E8 boards via `device` parameter. Three methods: SE-UART ISP, J-Link loadbin, and RTT OSPI programmer.
 
 ## CRITICAL: Use the fastest available method
 
@@ -22,7 +22,7 @@ For initial ATOC setup: use SE-UART `flash()`.
 pip install -e ".[dev]"
 ```
 
-Requires PRG_USB cable connected to Alif E7 AppKit.
+Requires PRG_USB cable connected to Alif E7 or E8 board.
 
 ## Tools
 
@@ -85,7 +85,9 @@ Use J-Link FLM workflow below instead.
 - RTT: **BROKEN** — M55_HP BusFault on OSPI controller access (EXPMST bridge issue). Do not use.
 - J-Link: ~44 KB/s (MRAM), ~7 KB/s (OSPI via FLM). Requires freshly power-cycled board. **Preferred for OSPI.**
 - SE-UART: ~5 KB/s via ISP protocol. 240-byte chunks, 2-byte LE sequence numbers.
-- MRAM addresses: TF-A@0x80002000, DTB@0x80010000, kernel@0x80020000, rootfs@0x80300000
+- All tools accept optional `device` parameter: `"alif-e7"` (default) or `"alif-e8"`
+- MRAM addresses (E7): TF-A@0x80002000, DTB@0x80010000, kernel@0x80020000, rootfs@0x80300000
+- MRAM addresses (E8): same except rootfs@0x80380000
 - OSPI addresses: rootfs@0xC0000000, kernel@0xC0800000 (IS25WX256 NOR flash)
 - After flash: power cycle (unplug/replug PRG_USB) required for A32 boot
 
@@ -95,4 +97,4 @@ Use J-Link FLM workflow below instead.
 python3 -m pytest tests/ -v
 ```
 
-93 tests: ISP protocol (18) + J-Link (38) + OSPI RTT (37).
+107 tests: ISP protocol (18) + J-Link (38) + OSPI RTT (37) + Device registry (14).

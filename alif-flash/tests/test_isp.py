@@ -1,4 +1,9 @@
-"""Tests for ISP protocol: checksum, packet framing, response parsing."""
+"""Tests for ISP protocol: checksum, packet framing, response parsing, gen_toc."""
+
+import json
+import os
+import tempfile
+from unittest.mock import patch
 
 from alif_flash.isp import (
     calc_checksum,
@@ -163,3 +168,109 @@ class TestConstants:
         assert CMD_BURN_MRAM == 0x08
         assert CMD_ACK == 0xFE
         assert CMD_DATA_RESP == 0xFD
+
+
+class TestGenTocIsolation:
+    """Tests for gen_toc device isolation (global-cfg.db writing + guard)."""
+
+    def _make_setools(self, tmpdir):
+        """Create minimal fake setools directory."""
+        utils_dir = os.path.join(tmpdir, "utils")
+        os.makedirs(utils_dir, exist_ok=True)
+        # Create a dummy app-gen-toc (won't be called — we mock subprocess)
+        gen_toc_path = os.path.join(tmpdir, "app-gen-toc")
+        with open(gen_toc_path, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(gen_toc_path, 0o755)
+        return tmpdir
+
+    @patch("alif_flash.isp.subprocess.run")
+    def test_writes_e7_global_cfg(self, mock_run):
+        """gen_toc for alif-e7 writes E7 global-cfg.db."""
+        mock_run.return_value = type("R", (), {
+            "returncode": 0,
+            "stdout": "Device Part# E7 (AE722F80F55D5LS)",
+            "stderr": "",
+        })()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_setools(tmpdir)
+            from alif_flash.isp import gen_toc
+            gen_toc(tmpdir, "build/config/linux-boot-e7.json", device="alif-e7")
+
+            gcfg_path = os.path.join(tmpdir, "utils", "global-cfg.db")
+            with open(gcfg_path) as f:
+                gcfg = json.load(f)
+            assert "AE722F80F55D5" in gcfg["DEVICE"]["Part#"]
+
+    @patch("alif_flash.isp.subprocess.run")
+    def test_writes_e8_global_cfg(self, mock_run):
+        """gen_toc for alif-e8 writes E8 global-cfg.db."""
+        mock_run.return_value = type("R", (), {
+            "returncode": 0,
+            "stdout": "Device Part# E8 (AE822FA0E5597LS0)",
+            "stderr": "",
+        })()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_setools(tmpdir)
+            from alif_flash.isp import gen_toc
+            gen_toc(tmpdir, "build/config/linux-boot-e8.json", device="alif-e8")
+
+            gcfg_path = os.path.join(tmpdir, "utils", "global-cfg.db")
+            with open(gcfg_path) as f:
+                gcfg = json.load(f)
+            assert "AE822FA0E5597" in gcfg["DEVICE"]["Part#"]
+
+    @patch("alif_flash.isp.subprocess.run")
+    def test_guard_detects_mismatch(self, mock_run):
+        """gen_toc fails if output references wrong device."""
+        # Simulate: asked for E7 but gen_toc output shows E8
+        mock_run.return_value = type("R", (), {
+            "returncode": 0,
+            "stdout": "Device Part# E8 (AE822FA0E5597LS0)",
+            "stderr": "",
+        })()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_setools(tmpdir)
+            from alif_flash.isp import gen_toc
+            result = gen_toc(tmpdir, "build/config/linux-boot-e7.json",
+                             device="alif-e7")
+            assert not result["success"]
+            assert "DEVICE MISMATCH" in result["message"]
+
+    @patch("alif_flash.isp.subprocess.run")
+    def test_guard_passes_on_match(self, mock_run):
+        """gen_toc succeeds when output matches target device."""
+        mock_run.return_value = type("R", (), {
+            "returncode": 0,
+            "stdout": "Device Part# E7 (AE722F80F55D5LS) - 5.5 MRAM",
+            "stderr": "",
+        })()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_setools(tmpdir)
+            from alif_flash.isp import gen_toc
+            result = gen_toc(tmpdir, "build/config/linux-boot-e7.json",
+                             device="alif-e7")
+            assert result["success"]
+
+    @patch("alif_flash.isp.subprocess.run")
+    def test_overwrites_stale_global_cfg(self, mock_run):
+        """gen_toc for E7 overwrites a stale E8 global-cfg.db."""
+        mock_run.return_value = type("R", (), {
+            "returncode": 0,
+            "stdout": "Device Part# E7 (AE722F80F55D5LS)",
+            "stderr": "",
+        })()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._make_setools(tmpdir)
+            # Write stale E8 config (simulating the bug)
+            gcfg_path = os.path.join(tmpdir, "utils", "global-cfg.db")
+            with open(gcfg_path, "w") as f:
+                json.dump({"DEVICE": {"Part#": "E8 (AE822FA0E5597LS0)"}}, f)
+
+            from alif_flash.isp import gen_toc
+            gen_toc(tmpdir, "build/config/linux-boot-e7.json", device="alif-e7")
+
+            with open(gcfg_path) as f:
+                gcfg = json.load(f)
+            # Should now be E7, not E8
+            assert "AE722F80F55D5" in gcfg["DEVICE"]["Part#"]

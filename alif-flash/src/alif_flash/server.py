@@ -326,7 +326,8 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
             if not setools_dir:
                 return _text("Error: --setools-dir not configured")
             config_rel = args["config"]
-            result = await asyncio.to_thread(isp.gen_toc, setools_dir, config_rel)
+            result = await asyncio.to_thread(
+                isp.gen_toc, setools_dir, config_rel, device=device)
             return _json(result)
 
         case "flash":

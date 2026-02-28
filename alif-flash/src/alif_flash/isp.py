@@ -548,13 +548,30 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
     }
 
 
-def gen_toc(setools_dir: str, config_rel: str) -> dict:
-    """Run app-gen-toc to generate ATOC package."""
+def gen_toc(setools_dir: str, config_rel: str,
+            device: str | None = None) -> dict:
+    """Run app-gen-toc to generate ATOC package.
+
+    Writes the correct global-cfg.db for the target device before running
+    to prevent cross-contamination between boards (e.g. E8 clocks on E7).
+    """
+    import json as _json
     import subprocess
+    from . import devices
 
     app_gen_toc = os.path.join(setools_dir, "app-gen-toc")
     if not os.path.exists(app_gen_toc):
         return {"success": False, "message": f"app-gen-toc not found at {app_gen_toc}"}
+
+    cfg = devices.get_config(device)
+
+    # Write global-cfg.db for the target device before gen_toc.
+    # This file controls which device's clock/pin config the SE applies.
+    # Without this, a previous tools-config selection can contaminate the ATOC.
+    global_cfg_path = os.path.join(setools_dir, "utils", "global-cfg.db")
+    if "global_cfg" in cfg and os.path.isdir(os.path.dirname(global_cfg_path)):
+        with open(global_cfg_path, "w") as f:
+            _json.dump(cfg["global_cfg"], f, indent=4)
 
     result = subprocess.run(
         ["./app-gen-toc", "-f", config_rel],
@@ -563,6 +580,19 @@ def gen_toc(setools_dir: str, config_rel: str) -> dict:
     if result.returncode != 0:
         return {"success": False, "message": f"app-gen-toc failed:\n{result.stderr}",
                 "stdout": result.stdout}
+
+    # Guard: verify gen_toc output references the correct device
+    part_number = cfg.get("part_number", "")
+    if part_number and part_number not in result.stdout:
+        return {
+            "success": False,
+            "message": (
+                f"DEVICE MISMATCH: gen_toc output does not contain expected "
+                f"part number '{part_number}' for device '{device or devices.DEFAULT_DEVICE}'. "
+                f"Check global-cfg.db and config file."
+            ),
+            "stdout": result.stdout,
+        }
 
     return {"success": True, "stdout": result.stdout, "stderr": result.stderr}
 
