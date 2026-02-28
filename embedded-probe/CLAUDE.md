@@ -28,6 +28,7 @@ src/
 
 ### Probe & Connection
 - `list_probes` — Find connected debug probes
+- `list_targets` — **List known-good target configs. Call BEFORE connect to get the correct chip name — do not guess.**
 - `connect` — Attach to probe + target chip (returns session_id)
 - `disconnect` — Release a debug session
 - `probe_info` — Get session info
@@ -98,3 +99,4 @@ These tools shell out to external CLIs. They fail at call time with an install h
 - **Coredump parser** (`coredump.rs`): Parses Zephyr's binary coredump format (version 2, ARM Cortex-M). Extracts exception frame registers (PC/LR/SP at crash site, not fault handler).
 - **Symbol resolution** (`symbols.rs`): Reads ELF symbol tables and DWARF debug info. Equivalent to `addr2line` but integrated.
 - **probe-rs**: All hardware interaction goes through the probe-rs library. Target chip names must match probe-rs's target database.
+- **CRITICAL: Always call `list_targets` before `connect`**. Do NOT guess or fabricate chip names. Wrong names cause JLink GUI dialogs that block execution. The `list_targets` tool returns verified chip names from real hardware testing.

@@ -513,6 +513,12 @@ pub struct LoadCustomTargetArgs {
     pub target_file_path: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListTargetsArgs {
+    /// Optional filter by family (e.g., "nrf", "stm32", "alif", "esp")
+    pub family: Option<String>,
+}
+
 // =============================================================================
 // Coredump Analysis Types
 // =============================================================================

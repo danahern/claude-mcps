@@ -2238,6 +2238,52 @@ except Exception as e:
         }
     }
 
+    #[tool(description = "List known-good target configurations that have been verified with real hardware. Use this BEFORE connect to get the correct chip name — do not guess target names.")]
+    async fn list_targets(&self, Parameters(args): Parameters<ListTargetsArgs>) -> Result<CallToolResult, McpError> {
+        debug!("Listing known-good targets, filter: {:?}", args.family);
+
+        let targets = known_targets();
+        let filter = args.family.as_deref().unwrap_or("");
+
+        let filtered: Vec<&KnownTarget> = if filter.is_empty() {
+            targets.iter().collect()
+        } else {
+            let f = filter.to_lowercase();
+            targets.iter().filter(|t| t.family.to_lowercase().contains(&f)).collect()
+        };
+
+        if filtered.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                format!("No known targets matching '{}'. Available families: {}",
+                    filter,
+                    targets.iter().map(|t| t.family).collect::<std::collections::BTreeSet<_>>()
+                        .into_iter().collect::<Vec<_>>().join(", "))
+            )]));
+        }
+
+        let mut result = format!("Known-good targets ({} matching):\n\n", filtered.len());
+        for t in &filtered {
+            result.push_str(&format!("  {} ({})\n", t.name, t.family));
+            result.push_str(&format!("    chip:       {}\n", t.chip));
+            result.push_str(&format!("    probe:      {}\n", t.probe_type));
+            if let Some(board) = &t.board {
+                result.push_str(&format!("    board:      {}\n", board));
+            }
+            if let Some(speed) = t.speed_khz {
+                result.push_str(&format!("    speed:      {} kHz\n", speed));
+            }
+            if !t.notes.is_empty() {
+                result.push_str(&format!("    notes:      {}\n", t.notes));
+            }
+            result.push('\n');
+        }
+
+        result.push_str("IMPORTANT: Use the exact 'chip' value with connect(). Do not modify or guess chip names.");
+
+        info!("Listed {} known targets", filtered.len());
+        Ok(CallToolResult::success(vec![Content::text(result)]))
+    }
+
     // =============================================================================
     // Advanced Debugging Tools (8 tools)
     // =============================================================================
@@ -3146,6 +3192,122 @@ fn format_memory_data(data: &[u8], format: &str, base_address: u64) -> String {
     }
 }
 
+// =============================================================================
+// Known-Good Target Registry
+// =============================================================================
+
+/// A target configuration verified to work with real hardware.
+pub struct KnownTarget {
+    pub name: &'static str,
+    pub family: &'static str,
+    pub chip: &'static str,
+    pub probe_type: &'static str,
+    pub board: Option<&'static str>,
+    pub speed_khz: Option<u32>,
+    pub notes: &'static str,
+}
+
+/// Returns the list of known-good target configurations.
+/// Add entries here as new hardware is verified.
+pub fn known_targets() -> Vec<KnownTarget> {
+    vec![
+        // Nordic
+        KnownTarget {
+            name: "nRF52840",
+            family: "nrf",
+            chip: "nRF52840_xxAA",
+            probe_type: "probe-rs (JLink/DAPLink)",
+            board: Some("nrf52840dk/nrf52840"),
+            speed_khz: Some(4000),
+            notes: "",
+        },
+        KnownTarget {
+            name: "nRF54L15",
+            family: "nrf",
+            chip: "nRF54L15_enga_xxAA",
+            probe_type: "nrfutil (probe-rs unreliable for flash)",
+            board: Some("nrf54l15dk/nrf54l15/cpuapp"),
+            speed_khz: Some(4000),
+            notes: "Use nrfutil_program for flash. probe-rs OK for RTT/debug after nrfutil recover.",
+        },
+        KnownTarget {
+            name: "nRF5340 (App Core)",
+            family: "nrf",
+            chip: "nRF5340_xxAA",
+            probe_type: "nrfutil",
+            board: Some("nrf7002dk/nrf5340/cpuapp"),
+            speed_khz: Some(4000),
+            notes: "Net core needs hci_ipc firmware. Use nrfutil for flash, probe-rs for debug.",
+        },
+        // STM32
+        KnownTarget {
+            name: "STM32F407VG",
+            family: "stm32",
+            chip: "STM32F407VGTx",
+            probe_type: "probe-rs (STLink/JLink)",
+            board: Some("stm32f4_disco"),
+            speed_khz: Some(4000),
+            notes: "",
+        },
+        KnownTarget {
+            name: "STM32MP157 (M4 core)",
+            family: "stm32",
+            chip: "STM32MP157CACx",
+            probe_type: "probe-rs (STLink)",
+            board: Some("stm32mp157c_dk2"),
+            speed_khz: Some(4000),
+            notes: "M4 coprocessor only. A7 runs Linux. Use remoteproc for production loading.",
+        },
+        // Alif Ensemble
+        KnownTarget {
+            name: "Alif E7 M55_HP",
+            family: "alif",
+            chip: "AE722F80F55D5_M55_HP",
+            probe_type: "JLink (custom device def required)",
+            board: Some("alif_e7_devkit"),
+            speed_khz: Some(4000),
+            notes: "Requires jlink_setup(install=true). Custom Devices.xml + JLinkScript.",
+        },
+        KnownTarget {
+            name: "Alif E7 A32",
+            family: "alif",
+            chip: "Cortex-A32",
+            probe_type: "JLink (JTAG, read-only after SE boot)",
+            board: Some("alif_e7_devkit"),
+            speed_khz: Some(4000),
+            notes: "MRAM write-protected after SE boot. Use for register/memory reads only.",
+        },
+        KnownTarget {
+            name: "Alif E8 M55_HP",
+            family: "alif",
+            chip: "AE822FA0E5597_M55_HP",
+            probe_type: "JLink (custom device def required)",
+            board: Some("alif_e8_devkit"),
+            speed_khz: Some(4000),
+            notes: "Requires jlink_setup(install=true). Same JLinkScript as E7.",
+        },
+        // ESP32
+        KnownTarget {
+            name: "ESP32",
+            family: "esp",
+            chip: "ESP32",
+            probe_type: "esptool (USB-UART)",
+            board: Some("esp32_devkitc"),
+            speed_khz: None,
+            notes: "Use esptool_flash/esptool_monitor. Not probe-rs compatible.",
+        },
+        KnownTarget {
+            name: "ESP32-S3",
+            family: "esp",
+            chip: "ESP32-S3",
+            probe_type: "esptool (USB-JTAG or USB-UART)",
+            board: Some("esp32s3_eye"),
+            speed_khz: None,
+            notes: "Use esptool_flash. USB-JTAG probe-rs support experimental.",
+        },
+    ]
+}
+
 #[tool_handler]
 impl ServerHandler for EmbeddedDebuggerToolHandler {
     fn get_info(&self) -> ServerInfo {
@@ -3153,7 +3315,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
             protocol_version: ProtocolVersion::V_2024_11_05,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, Zephyr coredump analysis, GDB server, RTT communication, and flash programming with real hardware integration. All 39 tools available: list_probes, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, analyze_coredump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, nrfutil_program, nrfutil_recover, nrfutil_reset, load_custom_target.".to_string()),
+            instructions: Some("Complete embedded debugging and flash programming MCP server supporting ARM Cortex-M, RISC-V, and other architectures via probe-rs. Provides comprehensive debugging and flash programming capabilities including probe detection, target connection, memory operations, breakpoints, watchpoints, register inspection, stack traces, core dumps, Zephyr coredump analysis, GDB server, RTT communication, and flash programming with real hardware integration. All 40 tools available: list_probes, list_targets, connect, disconnect, probe_info, halt, run, reset, step, get_status, read_memory, write_memory, set_breakpoint, clear_breakpoint, read_registers, write_register, resolve_symbol, stack_trace, set_watchpoint, clear_watchpoint, core_dump, analyze_coredump, gdb_server, rtt_attach, rtt_detach, rtt_read, rtt_write, rtt_channels, flash_erase, flash_program, flash_verify, run_firmware, validate_boot, esptool_flash, esptool_monitor, nrfjprog_flash, nrfutil_program, nrfutil_recover, nrfutil_reset, load_custom_target.".to_string()),
         }
     }
 
@@ -3162,7 +3324,7 @@ impl ServerHandler for EmbeddedDebuggerToolHandler {
         _request: InitializeRequestParam,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        info!("Complete Embedded Debugger MCP server initialized with all 39 tools");
+        info!("Complete Embedded Debugger MCP server initialized with all 40 tools");
         Ok(self.get_info())
     }
 }
@@ -3264,5 +3426,54 @@ mod tests {
     #[test]
     fn test_zero_not_ram() {
         assert!(!is_valid_ram_address(0x00000000));
+    }
+
+    // Known targets tests
+    #[test]
+    fn test_known_targets_not_empty() {
+        let targets = known_targets();
+        assert!(!targets.is_empty());
+    }
+
+    #[test]
+    fn test_known_targets_have_required_fields() {
+        for t in known_targets() {
+            assert!(!t.name.is_empty(), "target name must not be empty");
+            assert!(!t.family.is_empty(), "target family must not be empty");
+            assert!(!t.chip.is_empty(), "target chip must not be empty");
+            assert!(!t.probe_type.is_empty(), "target probe_type must not be empty");
+        }
+    }
+
+    #[test]
+    fn test_known_targets_no_duplicate_chips() {
+        let targets = known_targets();
+        let mut seen = std::collections::HashSet::new();
+        for t in &targets {
+            assert!(seen.insert(t.chip), "duplicate chip: {}", t.chip);
+        }
+    }
+
+    #[test]
+    fn test_known_targets_alif_e7_present() {
+        let targets = known_targets();
+        assert!(targets.iter().any(|t| t.chip == "AE722F80F55D5_M55_HP"),
+            "Alif E7 M55_HP must be in known targets");
+    }
+
+    #[test]
+    fn test_known_targets_alif_e8_present() {
+        let targets = known_targets();
+        assert!(targets.iter().any(|t| t.chip == "AE822FA0E5597_M55_HP"),
+            "Alif E8 M55_HP must be in known targets");
+    }
+
+    #[test]
+    fn test_known_targets_family_filter() {
+        let targets = known_targets();
+        let alif: Vec<_> = targets.iter().filter(|t| t.family == "alif").collect();
+        assert!(alif.len() >= 3, "should have at least 3 Alif targets");
+        let nrf: Vec<_> = targets.iter().filter(|t| t.family == "nrf").collect();
+        assert!(nrf.len() >= 2, "should have at least 2 nRF targets");
     }
 }
