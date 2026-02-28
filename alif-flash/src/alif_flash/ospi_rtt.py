@@ -1,6 +1,10 @@
 """OSPI flash programming via RTT using pylink-square.
 
-Programs OSPI NOR flash (IS25WX256) on the Alif E7 at ~500 KB/s
+BROKEN: M55_HP CPU cannot access OSPI controller (BusFault due to
+EXPMST bridge not forwarding 0x8xxx_xxxx addresses). RTT connects
+and firmware loads, but all flash operations hang/fail.
+
+Designed to program OSPI NOR flash (IS25WX256) on the Alif E7
 via a custom M55_HP firmware that receives commands over SEGGER RTT.
 
 Requires:
@@ -15,6 +19,15 @@ import os
 import struct
 import time
 import zlib
+
+# Monkey-patch pylink 2.0.0 bug: JlinkException vs JLinkException
+# TODO: Remove once pylink-square fixes the typo upstream
+try:
+    import pylink.errors as _pe
+    if not hasattr(_pe, 'JlinkException'):
+        _pe.JlinkException = _pe.JLinkException
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +342,18 @@ def connect_and_program(config_path, verify=True):
 
     jlink = pylink.JLink()
     try:
-        jlink.open()
+        # Find emulator explicitly — jlink.open() with no args can fail
+        # in subprocess contexts (e.g., MCP server)
+        emulators = jlink.connected_emulators()
+        if not emulators:
+            raise OspiProgrammerError("No J-Link emulators found")
+        try:
+            jlink.open(serial_no=emulators[0].SerialNumber)
+        except AttributeError:
+            # pylink-square 2.0.0 has a typo: JlinkException vs JLinkException
+            raise OspiProgrammerError(
+                f"J-Link open failed (found {len(emulators)} emulator(s), "
+                f"serial={emulators[0].SerialNumber})")
         jlink.connect(DEVICE, verbose=True)
         jlink.rtt_start()
 

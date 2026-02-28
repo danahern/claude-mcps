@@ -151,7 +151,7 @@ TOOLS = [
     ),
     Tool(
         name="ospi_program",
-        description="Program OSPI flash via RTT (~500 KB/s). Requires OSPI programmer firmware loaded via ATOC config. Use jlink_flash for FLM fallback (~7 KB/s).",
+        description="BROKEN: M55_HP BusFault on OSPI controller access. Use jlink_flash instead (~7 KB/s OSPI via FLM).",
         inputSchema={
             "type": "object",
             "properties": {

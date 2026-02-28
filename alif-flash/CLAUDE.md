@@ -6,13 +6,15 @@ Alif E7 flash MCP server — three methods: SE-UART ISP, J-Link loadbin, and RTT
 
 | Method | Speed | Use case |
 |--------|-------|----------|
-| `ospi_program` (RTT) | ~500 KB/s | **OSPI images — preferred** |
-| `jlink_flash` | ~44 KB/s (MRAM), ~7 KB/s (OSPI) | MRAM images, OSPI fallback |
+| `jlink_flash` | ~44 KB/s (MRAM), ~7 KB/s (OSPI) | **MRAM + OSPI images — preferred** |
 | `flash` (SE-UART) | ~5 KB/s | Initial ATOC setup only |
+| `ospi_program` (RTT) | **BROKEN** | Do not use — see below |
 
-For OSPI images: ALWAYS use `ospi_program()` (70x faster than JLink FLM).
+For OSPI images: use `jlink_flash()` (requires M55_HP debug stub in ATOC).
 For MRAM images: use `jlink_flash()`.
 For initial ATOC setup: use SE-UART `flash()`.
+
+**`ospi_program` is broken:** M55_HP CPU cannot access the OSPI controller (BusFault due to EXPMST bridge not forwarding 0x8xxx_xxxx addresses). The firmware loads and RTT connects, but flash operations hang. See knowledge item k-c3cbe077.
 
 ## Setup
 
@@ -24,8 +26,8 @@ Requires PRG_USB cable connected to Alif E7 AppKit.
 
 ## Tools
 
-### RTT OSPI Programmer (~500 KB/s)
-- `ospi_program(config?, image?, address?, verify?)` — Program OSPI flash via RTT
+### RTT OSPI Programmer (BROKEN — do not use)
+- `ospi_program(config?, image?, address?, verify?)` — **BROKEN:** M55_HP BusFault on OSPI access
 
 ### SE-UART (ISP protocol)
 - `list_ports()` — List available serial ports
@@ -41,21 +43,10 @@ Requires PRG_USB cable connected to Alif E7 AppKit.
 
 ## Typical Workflows
 
-### OSPI flash via RTT (fastest — preferred for OSPI)
+### ~~OSPI flash via RTT~~ (BROKEN — M55_HP BusFault on OSPI controller access)
 
-**Step 1 — One-time ATOC setup with RTT programmer firmware:**
-```
-1. alif-flash.gen_toc(config="build/config/linux-boot-e7-ospi-rtt.json")
-2. alif-flash.maintenance()
-3. alif-flash.flash(config="linux-boot-e7-ospi-rtt.json")
-   # Power cycle board
-```
-
-**Step 2 — OSPI programming via RTT (repeatable, ~500 KB/s):**
-```
-1. alif-flash.ospi_program(config="/path/to/linux-boot-e7-ospi-jlink.json", verify=true)
-   # Power cycle board after flash
-```
+Do not use. M55_HP cannot access the OSPI controller due to EXPMST bridge configuration.
+Use J-Link FLM workflow below instead.
 
 ### MRAM-only (J-Link)
 ```
@@ -64,7 +55,7 @@ Requires PRG_USB cable connected to Alif E7 AppKit.
    # Power cycle board after flash
 ```
 
-### OSPI flash via J-Link FLM (fallback — slower)
+### OSPI flash via J-Link FLM (preferred for OSPI)
 
 **Step 1 — One-time ATOC setup with debug stub:**
 ```
@@ -91,8 +82,8 @@ Requires PRG_USB cable connected to Alif E7 AppKit.
 
 ## Key Details
 
-- RTT: ~500 KB/s via OSPI programmer firmware on M55_HP. Requires `linux-boot-e7-ospi-rtt.json` ATOC.
-- J-Link: ~44 KB/s (MRAM), ~7 KB/s (OSPI via FLM). Requires freshly power-cycled board.
+- RTT: **BROKEN** — M55_HP BusFault on OSPI controller access (EXPMST bridge issue). Do not use.
+- J-Link: ~44 KB/s (MRAM), ~7 KB/s (OSPI via FLM). Requires freshly power-cycled board. **Preferred for OSPI.**
 - SE-UART: ~5 KB/s via ISP protocol. 240-byte chunks, 2-byte LE sequence numbers.
 - MRAM addresses: TF-A@0x80002000, DTB@0x80010000, kernel@0x80020000, rootfs@0x80300000
 - OSPI addresses: rootfs@0xC0000000, kernel@0xC0800000 (IS25WX256 NOR flash)
