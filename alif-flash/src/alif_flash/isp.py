@@ -380,7 +380,10 @@ def _write_segment(ser: serial.Serial, data: bytes, addr: int,
             logger.info("%s %d/%d (%d%%) [%.1fs]", label, chunk_num, total, pct, elapsed)
 
     send_cmd(ser, CMD_DOWNLOAD_DONE, label="DOWNLOAD_DONE")
-    return {"success": True, "chunks": total, "elapsed": time.time() - t0}
+    seg_elapsed = time.time() - t0
+    return {"success": True, "chunks": total, "elapsed": seg_elapsed,
+            "size_bytes": size,
+            "bytes_per_second": round(size / seg_elapsed) if seg_elapsed > 0 else 0}
 
 
 # Max bytes per BURN_MRAM session. When a USB drop is detected mid-segment,
@@ -538,13 +541,20 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
     finally:
         ser.close()
 
+    bps = round(total_bytes / total_time) if total_time > 0 else 0
     return {
         "success": True,
         "total_bytes": total_bytes,
         "total_seconds": round(total_time, 1),
+        "bytes_per_second": bps,
+        "speed_kbps": round(bps / 1024, 1),
         "image_count": len(images),
         "images": results,
-        "message": "All images written. Power cycle (unplug/replug PRG_USB) for A32 to boot.",
+        "message": (
+            f"All images written via SE-UART in {total_time:.1f}s "
+            f"({round(bps / 1024, 1)} KB/s). "
+            "Power cycle (unplug/replug PRG_USB) for A32 to boot."
+        ),
     }
 
 

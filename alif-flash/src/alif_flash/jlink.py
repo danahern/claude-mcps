@@ -319,27 +319,34 @@ def flash_images(image_dir: str, components: list[str] | None = None,
         # Parse per-file results — map temp .bin names back to originals
         file_results = _parse_loadbin_output(result["stdout"])
         tmp_to_orig = {}
+        file_sizes = {}
         for comp, load_path, orig_path, addr in load_files:
-            tmp_to_orig[os.path.basename(load_path)] = os.path.basename(orig_path)
+            orig_name = os.path.basename(orig_path)
+            tmp_to_orig[os.path.basename(load_path)] = orig_name
+            file_sizes[orig_name] = os.path.getsize(orig_path)
         for r in file_results:
             r["file"] = tmp_to_orig.get(r["file"], r["file"])
+            r["size_bytes"] = file_sizes.get(r["file"], 0)
 
         all_ok = all(r["success"] for r in file_results) if file_results else False
 
         # Check verify results
         verified = "Verify successful" in result.get("stdout", "") if verify else None
 
+        bps = round(total_bytes / elapsed) if elapsed > 0 else 0
         return {
             "success": all_ok,
             "method": "jlink_loadbin",
             "total_bytes": total_bytes,
             "elapsed_seconds": round(elapsed, 1),
-            "bytes_per_second": round(total_bytes / elapsed) if elapsed > 0 else 0,
+            "bytes_per_second": bps,
+            "speed_kbps": round(bps / 1024, 1),
             "components": len(files_to_flash),
             "files": file_results,
             "verified": verified,
             "message": (
-                f"{'All' if all_ok else 'Some'} images written via J-Link in {elapsed:.1f}s. "
+                f"{'All' if all_ok else 'Some'} images written via J-Link in {elapsed:.1f}s "
+                f"({round(bps / 1024, 1)} KB/s). "
                 "Power cycle (unplug/replug PRG_USB) for A32 to boot."
             ),
         }
