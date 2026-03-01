@@ -15,6 +15,8 @@ MCP servers for embedded development with Claude. Each server has its own `CLAUD
 | `hw-test-runner/` | Python | BLE and TCP hardware testing (WiFi provisioning, throughput) |
 | `alif-flash/` | Python | Alif Ensemble (E7/E8) MRAM flash via SE-UART ISP, J-Link, RTT |
 | `uart-mcp/` | Python | Bidirectional UART — session-based serial console interaction |
+| `openocd-debug/` | Rust | OpenOCD debugging via TCL socket protocol |
+| `knowledge-server/` | Rust | Knowledge capture, search, board profiles, rule/gotcha regeneration |
 
 ## Building
 
@@ -25,11 +27,14 @@ cd elf-analysis && cargo build --release
 cd zephyr-build && cargo build --release
 cd esp-idf-build && cargo build --release
 cd linux-build && cargo build --release
+cd openocd-debug && cargo build --release
+cd knowledge-server && cargo build --release
 
 # Python servers
 cd saleae-logic && pip install -e .
 cd hw-test-runner && pip install -e .
 cd alif-flash && pip install -e .
+cd uart-mcp && pip install -e .
 ```
 
 ## Adding a New MCP Server

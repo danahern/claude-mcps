@@ -48,8 +48,8 @@ The `image` parameter in `start_container` selects the Docker image per board:
 
 | Board | Docker Image | Build Command |
 |-------|-------------|---------------|
-| STM32MP1 | `stm32mp1-sdk` (default) | `make -C /workspace/firmware/linux/apps all install` |
-| Alif E7 | `alif-e7-sdk` | `make -C /workspace/firmware/linux/apps BOARD=alif-e7 all install` |
+| STM32MP1 | `stm32mp1-sdk` | `make -C /workspace/firmware/linux/apps all install` |
+| Alif E7 | `alif-e7-sdk:latest` (workspace default) | `make -C /workspace/firmware/linux/apps BOARD=alif-e7 all install` |
 
 ### Yocto builds with meta-eai
 
@@ -62,7 +62,7 @@ start_container(
     "/path/to/firmware/linux/yocto/meta-eai:/home/builder/yocto/meta-eai"
   ]
 )
-yocto_build(container="yocto-build", build_dir="build-stm32mp1", background=true)
+yocto_build(container="yocto-build", build_dir="build-alif-e7", background=true)
 yocto_build_status(build_id="...")
 ```
 
@@ -87,4 +87,4 @@ The bind mount overlays the named volume path, so `bblayers.conf` references res
 - Yocto builds track state in `Arc<RwLock<HashMap>>` — background builds via `tokio::spawn`
 - Board connections store transport details; subsequent tools can reference `board_id`
 - Flash image uses `spawn_blocking` to pipe `bzcat` stdout into SSH/ADB `dd`
-- Default Docker image: `stm32mp1-sdk` (configurable via `--docker-image`)
+- Default Docker image: `alif-e7-sdk:latest` (workspace-configured via `--docker-image`; code default is `stm32mp1-sdk`)

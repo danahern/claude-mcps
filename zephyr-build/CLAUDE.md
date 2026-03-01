@@ -10,7 +10,7 @@ cargo build --release
 
 ## Configuration
 
-Set `workspace_path` in config or pass per-call. Points to the directory containing `apps/` (e.g., the `zephyr-apps/` submodule).
+Set `workspace_path` in config or pass per-call. In this workspace, configured as `--workspace . --apps-dir firmware/apps`. Apps live at `firmware/apps/<name>/`.
 
 ## Tools
 
