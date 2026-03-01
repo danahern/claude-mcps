@@ -14,6 +14,7 @@ MCP servers for embedded development with Claude. Each server has its own `CLAUD
 | `saleae-logic/` | Python | Logic analyzer capture and protocol decoding |
 | `hw-test-runner/` | Python | BLE and TCP hardware testing (WiFi provisioning, throughput) |
 | `alif-flash/` | Python | Alif Ensemble (E7/E8) MRAM flash via SE-UART ISP, J-Link, RTT |
+| `uart-mcp/` | Python | Bidirectional UART — session-based serial console interaction |
 
 ## Building
 
