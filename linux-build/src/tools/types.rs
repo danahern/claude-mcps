@@ -237,6 +237,34 @@ fn default_yocto_build_dir() -> String { "build".to_string() }
 fn default_yocto_image() -> String { "core-image-minimal".to_string() }
 
 // ============================================================================
+// kernel_rebuild
+// ============================================================================
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KernelRebuildArgs {
+    /// Container name running the Yocto environment
+    pub container: String,
+    /// Build directory name (default: "build-alif-e7")
+    #[serde(default = "default_kernel_build_dir")]
+    pub build_dir: String,
+    /// Kernel recipe name (default: "linux-alif")
+    #[serde(default = "default_kernel_recipe")]
+    pub recipe: String,
+    /// Image to rebuild after kernel (e.g. "alif-tiny-image"). If omitted, only rebuilds kernel.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// CONFIG_ options to verify in .config after build (e.g. ["CONFIG_JFFS2_FS=y"])
+    #[serde(default)]
+    pub verify_configs: Option<Vec<String>>,
+    /// Run build in background (default: false)
+    #[serde(default)]
+    pub background: bool,
+}
+
+fn default_kernel_build_dir() -> String { "build-alif-e7".to_string() }
+fn default_kernel_recipe() -> String { "linux-alif".to_string() }
+
+// ============================================================================
 // yocto_build_status
 // ============================================================================
 

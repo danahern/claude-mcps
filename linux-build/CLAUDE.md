@@ -8,7 +8,7 @@ Docker-based Linux cross-compilation, ADB/SSH deployment, Yocto build tracking, 
 cargo build --release
 ```
 
-## Tools (17)
+## Tools (18)
 
 ### Container Lifecycle
 - `start_container` — Start Docker container with optional workspace mount and extra volumes, returns container name
@@ -36,6 +36,7 @@ cargo build --release
 ### Yocto Build
 - `yocto_build` — Run bitbake in container (foreground or background mode)
 - `yocto_build_status` — Check background build status, elapsed time, and truncated output
+- `kernel_rebuild` — Force-rebuild kernel after config changes (configure -f → compile -f → deploy -f), with optional image rebuild and config verification
 
 ### Board Connection
 - `board_connect` — Register SSH/ADB/auto board connection, returns board_id
@@ -53,27 +54,44 @@ The `image` parameter in `start_container` selects the Docker image per board:
 
 ### Yocto builds with meta-eai
 
-```
-start_container(
-  name="yocto-build",
-  image="yocto-builder",
-  extra_volumes=[
-    "yocto-data:/home/builder/yocto",
-    "/path/to/firmware/linux/yocto/meta-eai:/home/builder/yocto/meta-eai"
-  ]
-)
-yocto_build(container="yocto-build", build_dir="build-alif-e7", background=true)
-yocto_build_status(build_id="...")
+Container creation with meta-eai bind mount (host edits propagate automatically):
+```bash
+docker run -dit --name yocto-build \
+  -v yocto-data:/home/builder/yocto \
+  -v /Users/danahern/code/claude/work/yocto-build:/home/builder/artifacts \
+  -v /Users/danahern/code/claude/work/firmware/linux/yocto/meta-eai:/home/builder/yocto/meta-eai \
+  yocto-builder \
+  bash -c "sleep infinity"
 ```
 
-The bind mount overlays the named volume path, so `bblayers.conf` references resolve correctly.
+For recipe-only changes:
+```
+yocto_build(container="yocto-build", build_dir="build-alif-e7", image="alif-tiny-image")
+```
+
+For kernel config changes (`.cfg` fragments):
+```
+kernel_rebuild(
+  container="yocto-build",
+  image="alif-tiny-image",
+  verify_configs=["CONFIG_JFFS2_FS=y", "CONFIG_MTD_PHRAM=y"]
+)
+```
+
+`kernel_rebuild` parameters:
+- `container` (required) — Container name
+- `build_dir` (default: "build-alif-e7") — Yocto build directory
+- `recipe` (default: "linux-alif") — Kernel recipe name
+- `image` (optional) — Image to rebuild after kernel (e.g. "alif-tiny-image")
+- `verify_configs` (optional) — CONFIG_ options to verify in .config after build
+- `background` (default: false) — Run in background (use `yocto_build_status` to check)
 
 ## Architecture
 
 - `config.rs` — CLI args (clap) and runtime config (board IP, ADB serial, SSH)
 - `docker_client.rs` — Docker CLI wrapper (start/stop/exec/cp) + SSH/SCP + flash_image_ssh
 - `adb_client.rs` — ADB CLI wrapper (shell/push/pull/devices/flash_image_adb)
-- `tools/types.rs` — Serde/JsonSchema arg types for all 17 tools
+- `tools/types.rs` — Serde/JsonSchema arg types for all 18 tools
 - `tools/linux_build_tools.rs` — RMCP tool handler, Yocto build state, board connection state
 - `main.rs` — Entry point, logging setup
 

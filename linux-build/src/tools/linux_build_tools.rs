@@ -666,6 +666,166 @@ impl LinuxBuildToolHandler {
     }
 
     // =========================================================================
+    // Kernel Rebuild (1 tool)
+    // =========================================================================
+
+    #[tool(description = "Force-rebuild the kernel after config fragment changes. Runs configure -f, compile -f, deploy -f in the correct order, then optionally rebuilds the image. Verifies .config and vmlinux timestamp.")]
+    async fn kernel_rebuild(&self, Parameters(args): Parameters<KernelRebuildArgs>) -> Result<CallToolResult, McpError> {
+        // Pre-build: check for MX_FLASH_EN byte-swap misconfiguration
+        let mx_flash_warning = check_mx_flash_en(&args.container, &args.build_dir).await;
+        if let Some(ref warning) = mx_flash_warning {
+            return Err(make_error(warning.clone()));
+        }
+
+        // Build the chained command: configure -f → compile -f → deploy -f [→ image]
+        let mut shell_cmd = format!(
+            "cd /home/builder/yocto && source poky/oe-init-build-env {} > /dev/null && \
+             bitbake {} -c configure -f && \
+             bitbake {} -c compile -f && \
+             bitbake {} -c deploy -f",
+            args.build_dir, args.recipe, args.recipe, args.recipe
+        );
+
+        if let Some(ref image) = args.image {
+            shell_cmd.push_str(&format!(" && bitbake {}", image));
+        }
+
+        if args.background {
+            let build_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+            let state = YoctoBuildState {
+                status: YoctoBuildStatus::Running,
+                output: String::new(),
+                started_at: Instant::now(),
+                container: args.container.clone(),
+                image: args.image.clone().unwrap_or_else(|| args.recipe.clone()),
+            };
+
+            self.yocto_builds.write().await.insert(build_id.clone(), state);
+
+            let builds = self.yocto_builds.clone();
+            let build_id_clone = build_id.clone();
+            let container = args.container.clone();
+            let shell_cmd_clone = shell_cmd.clone();
+
+            tokio::spawn(async move {
+                let result = docker_client::exec_command(
+                    &container,
+                    &shell_cmd_clone,
+                    None,
+                ).await;
+
+                let mut builds = builds.write().await;
+                if let Some(state) = builds.get_mut(&build_id_clone) {
+                    match result {
+                        Ok(exec_result) => {
+                            let combined = format!("{}{}", exec_result.stdout, exec_result.stderr);
+                            state.output = truncate_output(&combined, 20, 80);
+                            state.status = if exec_result.success {
+                                YoctoBuildStatus::Complete
+                            } else {
+                                YoctoBuildStatus::Failed
+                            };
+                        }
+                        Err(e) => {
+                            state.output = e.to_string();
+                            state.status = YoctoBuildStatus::Failed;
+                        }
+                    }
+                }
+            });
+
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "Kernel rebuild started in background\n\
+                 Build ID: {}\n\
+                 Container: {}\n\
+                 Recipe: {}\n\
+                 Command: {}\n\n\
+                 Use yocto_build_status(build_id=\"{}\") to check progress.",
+                build_id, args.container, args.recipe, shell_cmd, build_id
+            ))]))
+        } else {
+            // Synchronous build
+            let result = docker_client::exec_command(
+                &args.container,
+                &shell_cmd,
+                None,
+            ).await.map_err(|e| make_error(e.to_string()))?;
+
+            if !result.success {
+                let combined = format!("{}{}", result.stdout, result.stderr);
+                let output = truncate_output(&combined, 20, 80);
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Kernel rebuild FAILED\nRecipe: {}\nExit code: {}\n\n{}",
+                    args.recipe, result.exit_code, output
+                ))]));
+            }
+
+            // Verification: check vmlinux timestamp and .config
+            let verify_cmd = format!(
+                "cd /home/builder/yocto/{} && \
+                 VMLINUX=$(find tmp/work -name vmlinux -path '*/linux-*/build/vmlinux' 2>/dev/null | head -1) && \
+                 echo \"vmlinux: $VMLINUX\" && \
+                 stat \"$VMLINUX\" 2>/dev/null | grep Modify || echo 'vmlinux not found' && \
+                 CONFIG=$(find tmp/work -name .config -path '*/linux-*/build/.config' 2>/dev/null | head -1) && \
+                 echo \"config: $CONFIG\"",
+                args.build_dir
+            );
+
+            let verify_result = docker_client::exec_command(
+                &args.container,
+                &verify_cmd,
+                None,
+            ).await.ok();
+
+            let mut output = format!("Kernel rebuild SUCCESS\nRecipe: {}\n", args.recipe);
+
+            if let Some(ref vr) = verify_result {
+                output.push_str(&format!("\n{}", vr.stdout.trim()));
+            }
+
+            // Config verification
+            if let Some(ref configs) = args.verify_configs {
+                if !configs.is_empty() {
+                    let pattern = configs.iter()
+                        .map(|c| c.split('=').next().unwrap_or(c))
+                        .collect::<Vec<_>>()
+                        .join("|");
+
+                    let config_cmd = format!(
+                        "cd /home/builder/yocto/{} && \
+                         CONFIG=$(find tmp/work -name .config -path '*/linux-*/build/.config' 2>/dev/null | head -1) && \
+                         grep -E '{}' \"$CONFIG\"",
+                        args.build_dir, pattern
+                    );
+
+                    let config_result = docker_client::exec_command(
+                        &args.container,
+                        &config_cmd,
+                        None,
+                    ).await.ok();
+
+                    if let Some(ref cr) = config_result {
+                        output.push_str(&format!("\n\nConfig verification:\n{}", cr.stdout.trim()));
+
+                        // Check each expected config
+                        for expected in configs {
+                            if !cr.stdout.contains(expected) {
+                                output.push_str(&format!("\nWARNING: {} not found in .config!", expected));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let build_output = format!("{}{}", result.stdout, result.stderr);
+            let truncated = truncate_output(&build_output, 10, 30);
+            output.push_str(&format!("\n\nBuild output:\n{}", truncated));
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    // =========================================================================
     // Board Connection (3 tools)
     // =========================================================================
 
@@ -811,7 +971,7 @@ impl LinuxBuildToolHandler {
     }
 }
 
-const TOOL_COUNT: usize = 17;
+const TOOL_COUNT: usize = 18;
 
 #[tool_handler]
 impl ServerHandler for LinuxBuildToolHandler {
@@ -825,7 +985,7 @@ impl ServerHandler for LinuxBuildToolHandler {
                  {} tools available: start_container, stop_container, container_status, \
                  run_command, build, list_artifacts, collect_artifacts, deploy, ssh_command, \
                  adb_shell, adb_deploy, adb_pull, flash_image, yocto_build, yocto_build_status, \
-                 board_connect, board_disconnect, board_status.",
+                 kernel_rebuild, board_connect, board_disconnect, board_status.",
                 TOOL_COUNT,
             )),
         }
@@ -882,7 +1042,7 @@ mod tests {
         let handler = LinuxBuildToolHandler::default();
         let info = handler.get_info();
         let instructions = info.instructions.unwrap();
-        assert!(instructions.contains("17 tools"));
+        assert!(instructions.contains("18 tools"));
         assert!(instructions.contains("adb_shell"));
         assert!(instructions.contains("flash_image"));
         assert!(instructions.contains("yocto_build"));
@@ -1074,6 +1234,45 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // Kernel rebuild tests
+
+    #[test]
+    fn test_kernel_rebuild_args_defaults() {
+        let json = r#"{"container": "yocto-build"}"#;
+        let args: KernelRebuildArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.container, "yocto-build");
+        assert_eq!(args.build_dir, "build-alif-e7");
+        assert_eq!(args.recipe, "linux-alif");
+        assert!(args.image.is_none());
+        assert!(args.verify_configs.is_none());
+        assert!(!args.background);
+    }
+
+    #[test]
+    fn test_kernel_rebuild_args_full() {
+        let json = r#"{
+            "container": "yocto-build",
+            "build_dir": "build-custom",
+            "recipe": "linux-custom",
+            "image": "core-image-minimal",
+            "verify_configs": ["CONFIG_JFFS2_FS=y", "CONFIG_MTD_PHRAM=y"],
+            "background": true
+        }"#;
+        let args: KernelRebuildArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.build_dir, "build-custom");
+        assert_eq!(args.recipe, "linux-custom");
+        assert_eq!(args.image.unwrap(), "core-image-minimal");
+        assert_eq!(args.verify_configs.unwrap().len(), 2);
+        assert!(args.background);
+    }
+
+    #[test]
+    fn test_kernel_rebuild_args_missing_container() {
+        let json = r#"{}"#;
+        let result: Result<KernelRebuildArgs, _> = serde_json::from_str(json);
+        assert!(result.is_err());
     }
 
     // Board connection tests
