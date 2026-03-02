@@ -60,6 +60,31 @@ OSPI_ADDR_THRESHOLD = 0xA0000000
 # OSPI flash erase sector size (IS25WX256/512 use 64KB sectors)
 OSPI_ERASE_SECTOR = 0x10000
 
+# ATOC-managed address regions — J-Link writes here are overwritten by SE on power cycle
+ATOC_MRAM_START = 0x80000000
+ATOC_MRAM_END = 0x80600000
+ATOC_OSPI_START = 0xC0000000
+
+
+def _atoc_warnings(layout: dict) -> list[str]:
+    """Check if any addresses in layout fall in ATOC-managed regions."""
+    warnings = []
+    for comp, info in layout.items():
+        addr = info["addr"]
+        if ATOC_MRAM_START <= addr < ATOC_MRAM_END:
+            warnings.append(
+                f"WARNING: {comp} @ 0x{addr:08X} is in ATOC-managed MRAM. "
+                "J-Link writes will be overwritten by SE on next power cycle. "
+                "Use SE-UART (gen_toc + flash) for persistent updates."
+            )
+        elif addr >= ATOC_OSPI_START:
+            warnings.append(
+                f"WARNING: {comp} @ 0x{addr:08X} is in ATOC-managed OSPI. "
+                "J-Link writes will be overwritten by SE on next power cycle. "
+                "Use SE-UART (gen_toc + flash) for persistent updates."
+            )
+    return warnings
+
 
 def check_setup(device: str | None = None) -> dict:
     """Check if JLinkExe and device definition are installed."""
@@ -334,7 +359,7 @@ def flash_images(image_dir: str, components: list[str] | None = None,
         verified = "Verify successful" in result.get("stdout", "") if verify else None
 
         bps = round(total_bytes / elapsed) if elapsed > 0 else 0
-        return {
+        result = {
             "success": all_ok,
             "method": "jlink_loadbin",
             "total_bytes": total_bytes,
@@ -350,6 +375,10 @@ def flash_images(image_dir: str, components: list[str] | None = None,
                 "Power cycle (unplug/replug PRG_USB) for A32 to boot."
             ),
         }
+        atoc_warns = _atoc_warnings(layout)
+        if atoc_warns:
+            result["warnings"] = atoc_warns
+        return result
     finally:
         if tmp_dir is not None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
