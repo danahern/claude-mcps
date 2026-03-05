@@ -11,15 +11,15 @@ class TestDeviceRegistry:
 
     def test_e7_config(self):
         cfg = DEVICES["alif-e7"]
-        assert cfg["jlink_device"] == "AE722F80F55D5_M55_HP"
+        assert cfg["jlink_device"] == "AE722F80F55D5_HP"
         assert cfg["isp_baud"] == 57600
         assert cfg["mram_layout"]["rootfs"]["addr"] == 0x80300000
 
     def test_e8_config(self):
         cfg = DEVICES["alif-e8"]
-        assert cfg["jlink_device"] == "AE822FA0E5597_M55_HP"
+        assert cfg["jlink_device"] == "AE822FA0E5597LS0_M55_HP"
         assert cfg["mram_layout"]["rootfs"]["addr"] == 0x80380000
-        assert cfg["jlink_device_reset"] == "Cortex-A32"
+        assert cfg["jlink_device_reset"] == "AE822FA0E5597LS0_A32_0"
 
     def test_both_devices_have_required_keys(self):
         required = [
@@ -81,7 +81,7 @@ class TestGetConfig:
 
     def test_explicit_e7(self):
         cfg = get_config("alif-e7")
-        assert cfg["jlink_device"] == "AE722F80F55D5_M55_HP"
+        assert cfg["jlink_device"] == "AE722F80F55D5_HP"
 
     def test_explicit_e8(self):
         cfg = get_config("alif-e8")

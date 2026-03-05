@@ -20,7 +20,7 @@
 -->
 <Database>
   <Device>
-    <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_M55_HP"
+    <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_HP"
               Core="JLINK_CORE_CORTEX_M55"
               WorkRAMAddr="0x00000000" WorkRAMSize="0x40000" />
     <FlashBankInfo Name="OSPI1 Flash" BaseAddr="0xC0000000" AlwaysPresent="1">

@@ -8,8 +8,8 @@ DEFAULT_DEVICE = "alif-e7"
 
 DEVICES = {
     "alif-e7": {
-        "jlink_device": "AE722F80F55D5_M55_HP",
-        "jlink_device_reset": "Cortex-A32",
+        "jlink_device": "AE722F80F55D5_HP",
+        "jlink_device_reset": "AE722F80F55D5_A32_0",
         "isp_baud": 57600,
         "part_number": "AE722F80F55D5",
         "mram_layout": {
@@ -35,8 +35,8 @@ DEVICES = {
         },
     },
     "alif-e8": {
-        "jlink_device": "AE822FA0E5597_M55_HP",  # derived from SE firmware package names
-        "jlink_device_reset": "Cortex-A32",
+        "jlink_device": "AE822FA0E5597LS0_M55_HP",
+        "jlink_device_reset": "AE822FA0E5597LS0_A32_0",
         "isp_baud": 57600,
         "part_number": "AE822FA0E5597",
         "mram_layout": {

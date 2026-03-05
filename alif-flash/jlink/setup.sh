@@ -18,6 +18,6 @@ mkdir -p "$DEST_DIR"
 cp "$SCRIPT_DIR/Devices.xml" "$DEST_DIR/"
 cp "$SCRIPT_DIR/AlifE7.JLinkScript" "$DEST_DIR/"
 
-echo "Done. JLinkExe will now recognize AE722F80F55D5_M55_HP with MRAM flash."
+echo "Done. JLinkExe will now recognize AE722F80F55D5_HP with MRAM flash."
 echo ""
-echo "Test with: JLinkExe -device AE722F80F55D5_M55_HP -if SWD -speed 4000 -autoconnect 1"
+echo "Test with: JLinkExe -device AE722F80F55D5_HP -if SWD -speed 4000 -autoconnect 1"

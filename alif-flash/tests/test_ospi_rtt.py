@@ -58,7 +58,7 @@ class TestProtocolConstants:
         assert RESP_FLAG == 0x80
 
     def test_device_name(self):
-        assert DEVICE == "AE722F80F55D5_M55_HP"
+        assert DEVICE == "AE722F80F55D5_HP"
 
 
 class TestCommandPacking:
