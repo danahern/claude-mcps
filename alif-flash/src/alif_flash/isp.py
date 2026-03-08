@@ -144,37 +144,32 @@ def wait_for_replug(timeout_disappear: float = 30, timeout_total: float = 60) ->
 
 def reset_via_jlink(device: str | None = None, interface: str = "SWD",
                     speed: int = 4000) -> dict:
-    """Reset the board via JLink, triggering SE boot sequence.
+    """Reset the board via JLink NSRST pin, triggering SE boot sequence.
 
-    Connects to the A32 core and issues a reset. The SE re-enters
-    ISP-responsive mode after the reset. JLink may report "Failed to halt
-    CPU" which is expected — we only need the reset, not halting.
+    Uses SetRESET/ClrRESET to pulse NSRST directly — no core connection
+    needed. This avoids SWD enumeration issues and doesn't disturb external
+    FTDI adapters sharing the board's UART pins.
     """
-    from .jlink import JLINK_EXE, DEVICE_RESET
-
-    if device is None:
-        device = DEVICE_RESET
+    from .jlink import JLINK_EXE
 
     if not os.path.exists(JLINK_EXE):
         return {"success": False, "message": f"JLinkExe not found at {JLINK_EXE}"}
 
     with tempfile.NamedTemporaryFile(mode='w', suffix='.jlink', delete=False) as f:
-        f.write("r\nsleep 100\nexit\n")
+        f.write("USB\nSetRESET\nSleep 100\nClrRESET\nSleep 200\nexit\n")
         script_path = f.name
 
     try:
         result = subprocess.run(
-            [JLINK_EXE, "-device", device, "-if", interface, "-speed", str(speed),
-             "-autoconnect", "1", "-NoGui", "1", "-CommanderScript", script_path],
+            [JLINK_EXE, "-if", interface, "-speed", str(speed),
+             "-NoGui", "1", "-CommanderScript", script_path],
             capture_output=True, text=True, timeout=15,
         )
-        logger.info("JLink reset: rc=%d", result.returncode)
-        # "Could not find core" = wrong device/no connection at all
-        # "Failed to halt" is expected (SE controls power domain) — reset still works
-        if "Could not find core" in result.stdout or "Cannot connect" in result.stdout:
-            return {"success": False, "message": "JLink could not connect to target",
+        logger.info("JLink NSRST reset: rc=%d", result.returncode)
+        if "Connecting to J-Link via USB...O.K." not in result.stdout:
+            return {"success": False, "message": "JLink USB connection failed",
                     "stdout": result.stdout[-500:]}
-        return {"success": True, "message": "Board reset via JLink",
+        return {"success": True, "message": "Board reset via JLink NSRST",
                 "stdout": result.stdout[-500:]}
     except subprocess.TimeoutExpired:
         return {"success": False, "message": "JLink command timed out"}
@@ -248,14 +243,50 @@ def probe(port: str) -> dict:
         ser.close()
 
 
+def _start_isp_with_timeout(port: str, timeout: float = 15.0) -> tuple[bool, "serial.Serial | None"]:
+    """Keep retrying START_ISP until it succeeds or timeout expires.
+
+    Useful when the port stays present across power cycles (FTDI adapters):
+    call this first, then power-cycle the board while it loops.
+    Returns (ok, open_serial_or_None).
+    """
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        try:
+            ser = open_serial(port, retries=1, retry_delay=0)
+        except (serial.SerialException, OSError):
+            time.sleep(0.5)
+            continue
+        try:
+            while ser.in_waiting:
+                ser.read(ser.in_waiting)
+                time.sleep(0.05)
+        except (serial.SerialException, OSError):
+            pass
+        ok, _ = send_cmd(ser, CMD_START_ISP, label=f"START_ISP(attempt {attempt})", quiet=True)
+        if ok:
+            logger.info("START_ISP: ACK (attempt %d)", attempt)
+            return True, ser
+        ser.close()
+        time.sleep(0.3)
+    return False, None
+
+
 def enter_maintenance(port: str, do_wait_for_replug: bool = False,
-                      jlink_reset: bool = False) -> dict:
+                      jlink_reset: bool = False,
+                      wait_for_power_cycle: bool = False,
+                      power_cycle_timeout: float = 15.0) -> dict:
     """Enter maintenance mode via ISP protocol.
 
     Flow: START_ISP -> SET_MAINTENANCE -> STOP_ISP -> RESET -> reconnect -> verify
 
     If jlink_reset=True, resets the board via JLink first (no manual power cycle needed).
     If do_wait_for_replug=True, waits for manual unplug/replug instead.
+    If wait_for_power_cycle=True, polls START_ISP for up to power_cycle_timeout seconds —
+      start this call BEFORE power-cycling so the board comes up while we're already looping.
+      Use this when the port stays present across power cycles (FTDI adapters on PRG_USB).
     """
     steps = []
 
@@ -280,17 +311,34 @@ def enter_maintenance(port: str, do_wait_for_replug: bool = False,
         port = new_port
         steps.append(f"port reappeared: {port}")
 
-    ser = open_serial(port)
-    try:
-        # Phase 1: Set maintenance flag
-        ok, _ = start_isp(ser)
+    if wait_for_power_cycle:
+        steps.append(f"polling START_ISP for up to {power_cycle_timeout:.0f}s — power cycle board now...")
+        ok, ser = _start_isp_with_timeout(port, timeout=power_cycle_timeout)
         if not ok:
             return {
                 "success": False,
-                "message": "SE did not respond. Try: unplug/replug PRG_USB, then run within 2-3s.",
+                "message": (
+                    f"SE did not respond within {power_cycle_timeout:.0f}s. "
+                    "Power cycle the board (unplug/replug PRG_USB to board) while this is running."
+                ),
                 "steps": steps,
             }
         steps.append("START_ISP: ACK")
+    else:
+        ser = open_serial(port)
+
+    try:
+        # Phase 1: Set maintenance flag (START_ISP already done if wait_for_power_cycle)
+        if not wait_for_power_cycle:
+            ok, _ = start_isp(ser)
+            if not ok:
+                ser.close()
+                return {
+                    "success": False,
+                    "message": "SE did not respond. Try: unplug/replug PRG_USB, then run within 2-3s.",
+                    "steps": steps,
+                }
+            steps.append("START_ISP: ACK")
 
         send_cmd(ser, CMD_SET_MAINTENANCE, label="SET_MAINTENANCE")
         steps.append("SET_MAINTENANCE: sent")
@@ -469,6 +517,7 @@ def write_image(port: str, path: str, addr: int) -> dict:
 
 def flash_images(port: str, config_path: str, enter_maint: bool = False,
                   do_wait_for_replug: bool = False, jlink_reset: bool = False,
+                  wait_for_power_cycle: bool = False, power_cycle_timeout: float = 15.0,
                   device: str | None = None) -> dict:
     """Flash ATOC package and all images defined in the ATOC JSON config."""
     import json
@@ -479,7 +528,9 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
 
     if enter_maint:
         maint_result = enter_maintenance(
-            port, do_wait_for_replug=do_wait_for_replug, jlink_reset=jlink_reset)
+            port, do_wait_for_replug=do_wait_for_replug, jlink_reset=jlink_reset,
+            wait_for_power_cycle=wait_for_power_cycle,
+            power_cycle_timeout=power_cycle_timeout)
         if not maint_result["success"]:
             return {"success": False, "message": "Failed to enter maintenance mode",
                     "maintenance": maint_result}
@@ -493,13 +544,26 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
     atoc_path = os.path.join(build_dir, "AppTocPackage.bin")
 
     images = []
+    erase_path = None
     if os.path.exists(atoc_path):
         atoc_size = os.path.getsize(atoc_path)
         atoc_addr = system_mram_base - atoc_size
         logger.info("ATOC: %d bytes -> 0x%08X", atoc_size, atoc_addr)
+
+        # Erase stale ATOC data below the new address. Different configs produce
+        # different-sized ATOCs at different addresses (system_mram_base - size).
+        # Stale 'ccBS' magic from a previous flash can confuse the SE scanner.
+        ATOC_ERASE_PAD = 8192
+        erase_addr = atoc_addr - ATOC_ERASE_PAD
+        erase_path = os.path.join(build_dir, ".atoc_erase.bin")
+        with open(erase_path, 'wb') as zf:
+            zf.write(b'\x00' * ATOC_ERASE_PAD)
+        images.append((erase_path, erase_addr))
+        logger.info("ATOC erase: %d bytes of zeros -> 0x%08X", ATOC_ERASE_PAD, erase_addr)
+
         images.append((atoc_path, atoc_addr))
     else:
-        logger.warning("AppTocPackage.bin not found at %s — run gen_toc first", atoc_path)
+        return {"success": False, "message": f"AppTocPackage.bin not found at {atoc_path} — run gen_toc first"}
 
     for key, entry in config.items():
         if key == "DEVICE" or not isinstance(entry, dict):
@@ -531,17 +595,42 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
 
     total_time = time.time() - t0
 
-    # Final reset
-    ser = open_serial(port)
-    try:
-        start_isp(ser)
-        send_cmd(ser, CMD_STOP_ISP, label="STOP_ISP")
-        ser.write(make_packet(CMD_RESET_DEVICE))
-        ser.flush()
-    finally:
-        ser.close()
+    # Clean up temp erase file
+    if erase_path and os.path.exists(erase_path):
+        os.unlink(erase_path)
+
+    # Final reset — use JLink NSRST if available (most reliable),
+    # otherwise fall back to ISP RESET_DEVICE command.
+    reset_method = "ISP RESET_DEVICE"
+    if jlink_reset:
+        logger.info("Post-flash reset via JLink NSRST")
+        reset_result = reset_via_jlink(device=device)
+        if reset_result["success"]:
+            reset_method = "JLink NSRST"
+        else:
+            logger.warning("JLink NSRST failed, falling back to ISP RESET_DEVICE")
+            ser = open_serial(port)
+            try:
+                start_isp(ser)
+                send_cmd(ser, CMD_STOP_ISP, label="STOP_ISP")
+                ser.write(make_packet(CMD_RESET_DEVICE))
+                ser.flush()
+            finally:
+                ser.close()
+    else:
+        ser = open_serial(port)
+        try:
+            start_isp(ser)
+            send_cmd(ser, CMD_STOP_ISP, label="STOP_ISP")
+            ser.write(make_packet(CMD_RESET_DEVICE))
+            ser.flush()
+        finally:
+            ser.close()
 
     bps = round(total_bytes / total_time) if total_time > 0 else 0
+    boot_msg = (f"Board reset via {reset_method} — SE will process ATOC and boot."
+                if jlink_reset or enter_maint
+                else "Power cycle (unplug/replug PRG_USB) for A32 to boot.")
     return {
         "success": True,
         "total_bytes": total_bytes,
@@ -553,7 +642,7 @@ def flash_images(port: str, config_path: str, enter_maint: bool = False,
         "message": (
             f"All images written via SE-UART in {total_time:.1f}s "
             f"({round(bps / 1024, 1)} KB/s). "
-            "Power cycle (unplug/replug PRG_USB) for A32 to boot."
+            f"{boot_msg}"
         ),
     }
 
@@ -608,8 +697,14 @@ def gen_toc(setools_dir: str, config_rel: str,
 
 
 def monitor(port: str, baud: int = 115200, duration: float = 15,
-            do_wait_for_replug: bool = False) -> dict:
-    """Read serial console output. Optionally wait for board power cycle first."""
+            do_wait_for_replug: bool = False,
+            jlink_reset: bool = False) -> dict:
+    """Read serial console output. Optionally wait for board power cycle first.
+
+    If jlink_reset=True, opens the port first, drains stale data, then
+    triggers a JLink NSRST reset via SetRESET/ClrRESET (no core connection,
+    no FTDI disruption) and captures the SE boot output.
+    """
     if do_wait_for_replug:
         new_port = wait_for_replug()
         if not new_port:
@@ -622,6 +717,12 @@ def monitor(port: str, baud: int = 115200, duration: float = 15,
         while ser.in_waiting:
             ser.read(ser.in_waiting)
             time.sleep(0.05)
+
+        if jlink_reset:
+            r = reset_via_jlink()
+            if not r["success"]:
+                ser.close()
+                return {"success": False, "message": f"JLink reset failed: {r['message']}"}
 
         buf = b''
         t0 = time.time()
@@ -636,6 +737,7 @@ def monitor(port: str, baud: int = 115200, duration: float = 15,
             "bytes": len(buf),
             "baud": baud,
             "port": port,
+            "jlink_reset": jlink_reset,
             "duration_seconds": round(time.time() - t0, 1),
             "output": text,
         }

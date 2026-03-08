@@ -4,13 +4,18 @@
   Install to: ~/Library/Application Support/SEGGER/JLinkDevices/AlifSemi/
   The J-Link DLL recursively scans JLinkDevices/ for *.xml files.
 
-  MRAM at 0x80000000 is memory-mapped and writable via direct loadbin.
-  No flash algorithm needed — MRAM doesn't require erase cycles.
+  NOTE: JLink V9.20's built-in device database takes priority over custom
+  XML for matching device names. These definitions still serve as reference
+  and may override in future JLink versions.
+
+  MRAM flash algorithm behavior (Ensemble.FLM, Bank 0 @ 0x80000000):
+  - On disconnect, JLink writes back current MRAM state (preserves w4 writes)
+  - ATOC data persists across JLink sessions — the SE clears it after
+    processing during boot (by design), not JLink.
 
   OSPI1 flash at 0xC0000000 (IS25WX512M) uses Ensemble_IS25WX256.FLM
   flash loader. J-Link automatically routes loadbin writes to this
   address range through the flash algorithm (handles erase/program).
-  The FLM must be installed separately from Segger's Alif device pack.
 
   The JLinkScript (AlifE7.JLinkScript) prevents reset during loadbin —
   the SE controls the boot sequence and resetting via SWD kills AP[3]
@@ -19,6 +24,7 @@
   on the command line instead.
 -->
 <Database>
+  <!-- M55_HP: used for OSPI programming and flasher firmware -->
   <Device>
     <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_HP"
               Core="JLINK_CORE_CORTEX_M55"
@@ -28,5 +34,25 @@
                   Loader="Ensemble_IS25WX256.FLM"
                   LoaderType="FLASH_ALGO_TYPE_OPEN" />
     </FlashBankInfo>
+  </Device>
+
+  <!-- M55_HE: used for ATOC/MRAM writes (no MRAM flash bank — prevents ATOC clearing) -->
+  <Device>
+    <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_HE"
+              Core="JLINK_CORE_CORTEX_M55"
+              WorkRAMAddr="0x00000000" WorkRAMSize="0x40000" />
+  </Device>
+
+  <!-- A32 cores: used for Linux debugging (no flash banks needed) -->
+  <Device>
+    <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_A32_0"
+              Core="JLINK_CORE_CORTEX_A32"
+              WorkRAMAddr="0x02000000" WorkRAMSize="0x400000" />
+  </Device>
+
+  <Device>
+    <ChipInfo Vendor="AlifSemi" Name="AE722F80F55D5_A32_1"
+              Core="JLINK_CORE_CORTEX_A32"
+              WorkRAMAddr="0x02000000" WorkRAMSize="0x400000" />
   </Device>
 </Database>

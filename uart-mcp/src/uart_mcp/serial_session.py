@@ -73,11 +73,17 @@ class SerialSession:
         return ser.write(data)
 
     def read_output(self, timeout: float = 0.5) -> str:
-        """Read pending output using idle timeout. Returns decoded text."""
+        """Read pending output using idle timeout. Returns decoded text.
+
+        The idle timeout resets on each chunk of data, but a hard maximum
+        of 10x the idle timeout (min 10s) prevents infinite reads on
+        noisy lines that trickle bytes continuously.
+        """
         ser = self._ensure_open()
         output = b""
+        max_deadline = time.monotonic() + max(timeout * 10, 10.0)
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and time.monotonic() < max_deadline:
             chunk = ser.read(ser.in_waiting or 1)
             if chunk:
                 output += chunk

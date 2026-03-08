@@ -359,6 +359,13 @@ def flash_images(image_dir: str, components: list[str] | None = None,
         verified = "Verify successful" in result.get("stdout", "") if verify else None
 
         bps = round(total_bytes / elapsed) if elapsed > 0 else 0
+        # Post-flash reset via JLink NSRST
+        from .isp import reset_via_jlink
+        reset_result = reset_via_jlink(device=device)
+        reset_msg = ("Board reset via JLink NSRST — SE will process ATOC and boot."
+                     if reset_result.get("success")
+                     else "Power cycle (unplug/replug PRG_USB) for A32 to boot.")
+
         result = {
             "success": all_ok,
             "method": "jlink_loadbin",
@@ -372,7 +379,7 @@ def flash_images(image_dir: str, components: list[str] | None = None,
             "message": (
                 f"{'All' if all_ok else 'Some'} images written via J-Link in {elapsed:.1f}s "
                 f"({round(bps / 1024, 1)} KB/s). "
-                "Power cycle (unplug/replug PRG_USB) for A32 to boot."
+                f"{reset_msg}"
             ),
         }
         atoc_warns = _atoc_warnings(layout)

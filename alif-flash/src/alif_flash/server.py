@@ -43,7 +43,13 @@ TOOLS = [
     ),
     Tool(
         name="maintenance",
-        description="Enter maintenance mode: START_ISP -> SET_MAINTENANCE -> RESET -> verify. Required before flashing. Use jlink_reset=true to avoid manual power cycle.",
+        description=(
+            "Enter maintenance mode: START_ISP -> SET_MAINTENANCE -> RESET -> verify. "
+            "Required before flashing. "
+            "Use wait_for_power_cycle=true when the port stays alive across power cycles "
+            "(FTDI adapters): call this FIRST, then immediately power-cycle the board — "
+            "the tool polls START_ISP for power_cycle_timeout seconds while you do it."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -60,6 +66,19 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Wait for manual USB unplug/replug before sending ISP commands",
                     "default": False,
+                },
+                "wait_for_power_cycle": {
+                    "type": "boolean",
+                    "description": (
+                        "Poll START_ISP for power_cycle_timeout seconds — start this call BEFORE "
+                        "power-cycling the board. Use when FTDI port stays present across power cycles."
+                    ),
+                    "default": False,
+                },
+                "power_cycle_timeout": {
+                    "type": "number",
+                    "description": "Seconds to poll for SE response when wait_for_power_cycle=true (default: 15)",
+                    "default": 15,
                 },
                 "device": _DEVICE_PROPERTY,
             },
@@ -82,7 +101,13 @@ TOOLS = [
     ),
     Tool(
         name="flash",
-        description="Write ATOC package + all images to MRAM from an ATOC JSON config. Writes AppTocPackage.bin first, then all config entries with mramAddress+binary fields. Board must be in maintenance mode.",
+        description=(
+            "Write ATOC package + all images to MRAM from an ATOC JSON config. "
+            "Writes AppTocPackage.bin first, then all config entries with mramAddress+binary fields. "
+            "Board must be in maintenance mode. "
+            "Use maintenance=true + wait_for_power_cycle=true to enter maintenance automatically: "
+            "call flash first, then power-cycle the board while it polls."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -108,6 +133,19 @@ TOOLS = [
                     "type": "boolean",
                     "description": "Wait for manual USB unplug/replug before entering maintenance. Requires maintenance=true.",
                     "default": False,
+                },
+                "wait_for_power_cycle": {
+                    "type": "boolean",
+                    "description": (
+                        "Poll START_ISP for power_cycle_timeout seconds — start this call BEFORE "
+                        "power-cycling the board. Requires maintenance=true."
+                    ),
+                    "default": False,
+                },
+                "power_cycle_timeout": {
+                    "type": "number",
+                    "description": "Seconds to poll for SE response when wait_for_power_cycle=true (default: 15)",
+                    "default": 15,
                 },
                 "device": _DEVICE_PROPERTY,
             },
@@ -191,7 +229,7 @@ TOOLS = [
     ),
     Tool(
         name="monitor",
-        description="Read serial console output at a given baud rate. Use after moving J15 jumper to UART2 position. Can optionally wait for a board power cycle (unplug/replug) to capture boot output from the start.",
+        description="Read serial console output at a given baud rate. Use jlink_reset=true to trigger a JLink NSRST reset and capture SE boot output (e.g. to check for '[SES] No ATOC' or boot success). Can also wait for a board power cycle (unplug/replug) to capture boot output from the start.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -208,6 +246,11 @@ TOOLS = [
                     "type": "number",
                     "description": "How long to read in seconds (default: 15)",
                     "default": 15,
+                },
+                "jlink_reset": {
+                    "type": "boolean",
+                    "description": "Trigger JLink NSRST reset before reading — captures SE boot output from the start. Port is opened first, then reset fires.",
+                    "default": False,
                 },
                 "wait_for_replug": {
                     "type": "boolean",
@@ -316,9 +359,13 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
             port = _resolve_port(args)
             jlink_reset = args.get("jlink_reset", False)
             wait_replug = args.get("wait_for_replug", False)
+            wait_power_cycle = args.get("wait_for_power_cycle", False)
+            power_cycle_timeout = float(args.get("power_cycle_timeout", 15))
             result = await asyncio.to_thread(
                 isp.enter_maintenance, port,
-                do_wait_for_replug=wait_replug, jlink_reset=jlink_reset
+                do_wait_for_replug=wait_replug, jlink_reset=jlink_reset,
+                wait_for_power_cycle=wait_power_cycle,
+                power_cycle_timeout=power_cycle_timeout,
             )
             return _json(result)
 
@@ -339,9 +386,13 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
             enter_maint = args.get("maintenance", False)
             jlink_reset = args.get("jlink_reset", False)
             wait_replug = args.get("wait_for_replug", False)
+            wait_power_cycle = args.get("wait_for_power_cycle", False)
+            power_cycle_timeout = float(args.get("power_cycle_timeout", 15))
             result = await asyncio.to_thread(
                 isp.flash_images, port, config_path, enter_maint,
                 do_wait_for_replug=wait_replug, jlink_reset=jlink_reset,
+                wait_for_power_cycle=wait_power_cycle,
+                power_cycle_timeout=power_cycle_timeout,
                 device=device
             )
             return _json(result)
@@ -404,8 +455,10 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
             baud = args.get("baud", 115200)
             duration = args.get("duration", 15)
             wait_replug = args.get("wait_for_replug", False)
+            jlink_reset = args.get("jlink_reset", False)
             result = await asyncio.to_thread(
-                isp.monitor, port, baud, duration, wait_replug
+                isp.monitor, port, baud, duration, wait_replug,
+                jlink_reset,
             )
             return _json(result)
 

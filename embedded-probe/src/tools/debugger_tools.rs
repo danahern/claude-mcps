@@ -20,6 +20,7 @@ use super::types::*;
 // Flash types will be used through crate::flash:: prefix
 use crate::rtt::RttManager;
 use crate::symbols::SymbolTable;
+use crate::backend::{DebugBackend, JLinkBackend};
 use regex;
 
 // Probe-rs imports
@@ -33,8 +34,35 @@ pub struct DebugSession {
     pub probe_identifier: String,
     pub target_chip: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub session: Arc<tokio::sync::Mutex<Session>>,
+    pub backend: DebugBackend,
     pub rtt_manager: Arc<tokio::sync::Mutex<RttManager>>,
+}
+
+impl DebugSession {
+    /// Get probe-rs session if using probe-rs backend
+    pub fn probe_rs_session(&self) -> Option<&Arc<tokio::sync::Mutex<Session>>> {
+        match &self.backend {
+            DebugBackend::ProbeRs(session) => Some(session),
+            _ => None,
+        }
+    }
+
+    /// Get JLink backend if using JLink backend
+    pub fn jlink(&self) -> Option<&JLinkBackend> {
+        match &self.backend {
+            DebugBackend::JLink(backend) => Some(backend),
+            _ => None,
+        }
+    }
+
+    /// Require probe-rs backend, returning MCP error if JLink
+    pub fn require_probe_rs(&self) -> Result<&Arc<tokio::sync::Mutex<Session>>, McpError> {
+        match &self.backend {
+            DebugBackend::ProbeRs(session) => Ok(session),
+            DebugBackend::JLink(_) => Err(McpError::internal_error(
+                "This tool requires probe-rs backend. Not available on JLink backend.".to_string(), None)),
+        }
+    }
 }
 
 /// Complete embedded debugger tool handler with all debugging tools
@@ -156,27 +184,28 @@ impl EmbeddedDebuggerToolHandler {
                         match probe.attach(&args.target_chip, Permissions::default()) {
                             Ok(session) => {
                                 let session_id = format!("session_{}", chrono::Utc::now().timestamp_millis());
-                                
+
                                 let debug_session = DebugSession {
                                     session_id: session_id.clone(),
                                     probe_identifier: probe_info.identifier.clone(),
                                     target_chip: args.target_chip.clone(),
                                     created_at: chrono::Utc::now(),
-                                    session: Arc::new(tokio::sync::Mutex::new(session)),
+                                    backend: DebugBackend::ProbeRs(Arc::new(tokio::sync::Mutex::new(session))),
                                     rtt_manager: Arc::new(tokio::sync::Mutex::new(RttManager::new())),
                                 };
-                                
+
                                 // Store session
                                 {
                                     let mut sessions = self.sessions.write().await;
                                     sessions.insert(session_id.clone(), Arc::new(debug_session));
                                 }
-                                
+
                                 let message = format!(
                                     "✅ Debug session established!\n\n\
                                     Session ID: {}\n\
                                     Probe: {} (VID:PID = {:04X}:{:04X})\n\
                                     Target: {}\n\
+                                    Backend: probe-rs\n\
                                     Connected at: {}\n\n\
                                     Target connection established and ready for debugging.\n\
                                     Use this session ID for all debug operations.",
@@ -186,22 +215,94 @@ impl EmbeddedDebuggerToolHandler {
                                     args.target_chip,
                                     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
                                 );
-                                
-                                info!("Created debug session: {}", session_id);
+
+                                info!("Created debug session: {} (probe-rs)", session_id);
                                 Ok(CallToolResult::success(vec![Content::text(message)]))
                             }
                             Err(e) => {
-                                error!("Failed to attach to target '{}': {}", args.target_chip, e);
-                                let error_msg = format!(
-                                    "❌ Failed to attach to target '{}'\n\n\
-                                    Error: {}\n\n\
-                                    Suggestions:\n\
-                                    - Check target chip name (try: STM32F407VGTx, nRF52840_xxAA)\n\
-                                    - Ensure target is powered and connected\n\
-                                    - Verify SWD/JTAG connections",
-                                    args.target_chip, e
-                                );
-                                Err(McpError::internal_error(error_msg, None))
+                                // probe-rs failed — try JLink fallback if probe is a J-Link
+                                let is_jlink = probe_info.identifier.contains("J-Link")
+                                    || probe_info.vendor_id == 0x1366;
+
+                                if is_jlink {
+                                    info!("probe-rs attach failed for '{}', trying JLinkExe backend", args.target_chip);
+
+                                    let serial = probe_info.serial_number.clone();
+                                    let jlink = JLinkBackend::new(
+                                        &args.target_chip,
+                                        args.speed_khz,
+                                        serial,
+                                    );
+
+                                    match jlink.test_connection().await {
+                                        Ok(core_id) => {
+                                            let session_id = format!("session_{}", chrono::Utc::now().timestamp_millis());
+
+                                            let debug_session = DebugSession {
+                                                session_id: session_id.clone(),
+                                                probe_identifier: probe_info.identifier.clone(),
+                                                target_chip: args.target_chip.clone(),
+                                                created_at: chrono::Utc::now(),
+                                                backend: DebugBackend::JLink(jlink),
+                                                rtt_manager: Arc::new(tokio::sync::Mutex::new(RttManager::new())),
+                                            };
+
+                                            {
+                                                let mut sessions = self.sessions.write().await;
+                                                sessions.insert(session_id.clone(), Arc::new(debug_session));
+                                            }
+
+                                            let message = format!(
+                                                "✅ Debug session established!\n\n\
+                                                Session ID: {}\n\
+                                                Probe: {} (VID:PID = {:04X}:{:04X})\n\
+                                                Target: {}\n\
+                                                Backend: JLinkExe (auto-fallback from probe-rs)\n\
+                                                Core: {}\n\
+                                                Connected at: {}\n\n\
+                                                Note: Using JLinkExe subprocess backend. Some features (RTT, breakpoints) \
+                                                may not be available.\n\
+                                                Use this session ID for all debug operations.",
+                                                session_id,
+                                                probe_info.identifier,
+                                                probe_info.vendor_id, probe_info.product_id,
+                                                args.target_chip,
+                                                core_id,
+                                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                                            );
+
+                                            info!("Created debug session: {} (JLinkExe fallback)", session_id);
+                                            Ok(CallToolResult::success(vec![Content::text(message)]))
+                                        }
+                                        Err(jlink_err) => {
+                                            error!("Both probe-rs and JLinkExe failed for '{}': probe-rs={}, jlink={}",
+                                                args.target_chip, e, jlink_err);
+                                            let error_msg = format!(
+                                                "❌ Failed to attach to target '{}'\n\n\
+                                                probe-rs error: {}\n\
+                                                JLinkExe error: {}\n\n\
+                                                Suggestions:\n\
+                                                - Check target chip name (use list_targets for verified names)\n\
+                                                - Ensure target is powered and connected\n\
+                                                - Verify SWD/JTAG connections",
+                                                args.target_chip, e, jlink_err
+                                            );
+                                            Err(McpError::internal_error(error_msg, None))
+                                        }
+                                    }
+                                } else {
+                                    error!("Failed to attach to target '{}': {}", args.target_chip, e);
+                                    let error_msg = format!(
+                                        "❌ Failed to attach to target '{}'\n\n\
+                                        Error: {}\n\n\
+                                        Suggestions:\n\
+                                        - Check target chip name (try: STM32F407VGTx, nRF52840_xxAA)\n\
+                                        - Ensure target is powered and connected\n\
+                                        - Verify SWD/JTAG connections",
+                                        args.target_chip, e
+                                    );
+                                    Err(McpError::internal_error(error_msg, None))
+                                }
                             }
                         }
                     }
@@ -321,7 +422,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Halt the target CPU execution")]
     async fn halt(&self, Parameters(args): Parameters<HaltArgs>) -> Result<CallToolResult, McpError> {
         debug!("Halting target for session: {}", args.session_id);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -332,10 +433,24 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
-        
-        // Halt the target
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let (pc, _output) = jlink.halt().await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Target halted successfully!\n\n\
+                Session ID: {}\n\
+                PC: 0x{:08X}\n\
+                State: Halted\n\
+                Backend: JLinkExe\n",
+                args.session_id, pc
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -387,7 +502,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Resume target CPU execution")]
     async fn run(&self, Parameters(args): Parameters<RunArgs>) -> Result<CallToolResult, McpError> {
         debug!("Running target for session: {}", args.session_id);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -398,10 +513,23 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
-        
-        // Resume the target
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            jlink.run().await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Target resumed execution successfully!\n\n\
+                Session ID: {}\n\
+                Status: Running\n\
+                Backend: JLinkExe\n",
+                args.session_id
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -434,7 +562,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Reset the target CPU")]
     async fn reset(&self, Parameters(args): Parameters<ResetArgs>) -> Result<CallToolResult, McpError> {
         debug!("Resetting target for session: {}", args.session_id);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -445,10 +573,31 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
-        
-        // Reset the target
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let (pc, _output) = jlink.reset(args.halt_after_reset, &args.reset_type).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Target reset completed successfully!\n\n\
+                Session ID: {}\n\
+                Reset type: {}\n\
+                Halted after reset: {}\n\
+                PC: 0x{:08X}\n\
+                State: {}\n\
+                Backend: JLinkExe\n",
+                args.session_id,
+                args.reset_type,
+                args.halt_after_reset,
+                pc,
+                if args.halt_after_reset { "Halted" } else { "Running" }
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -498,7 +647,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Execute a single instruction step")]
     async fn step(&self, Parameters(args): Parameters<StepArgs>) -> Result<CallToolResult, McpError> {
         debug!("Single stepping target for session: {}", args.session_id);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -509,10 +658,24 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
-        
-        // Single step the target
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let (pc, _output) = jlink.step().await.map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Single step completed!\n\n\
+                Session ID: {}\n\
+                PC: 0x{:08X}\n\
+                State: Halted\n\
+                Backend: JLinkExe\n",
+                args.session_id, pc
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -549,7 +712,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Get current status of the target CPU and debug session")]
     async fn get_status(&self, Parameters(args): Parameters<GetStatusArgs>) -> Result<CallToolResult, McpError> {
         debug!("Getting status for session: {}", args.session_id);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -560,10 +723,35 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
-        
-        // Get target status
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let (pc, is_halted, _output) = jlink.get_status().await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "📊 Debug Session Status\n\n\
+                Core Information:\n\
+                - PC: 0x{:08X}\n\
+                - State: {}\n\n\
+                Session Information:\n\
+                - ID: {}\n\
+                - Target: {}\n\
+                - Probe: {}\n\
+                - Backend: JLinkExe\n\
+                - Duration: {:.1} minutes\n",
+                pc,
+                if is_halted { "Halted" } else { "Running" },
+                args.session_id,
+                session_arc.target_chip,
+                session_arc.probe_identifier,
+                (chrono::Utc::now() - session_arc.created_at).num_seconds() as f64 / 60.0
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -623,7 +811,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Read memory from the target")]
     async fn read_memory(&self, Parameters(args): Parameters<ReadMemoryArgs>) -> Result<CallToolResult, McpError> {
         debug!("Reading memory for session: {} at address {}", args.session_id, args.address);
-        
+
         // Parse address
         let address = match parse_address(&args.address) {
             Ok(addr) => addr,
@@ -644,9 +832,27 @@ impl EmbeddedDebuggerToolHandler {
             }
         };
 
-        // Read memory
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let data = jlink.read_memory(address, args.size as u32).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let formatted_data = format_memory_data(&data, &args.format, address);
+            let message = format!(
+                "📖 Memory read completed successfully!\n\n\
+                Session ID: {}\n\
+                Address: 0x{:08X}\n\
+                Size: {} bytes\n\
+                Format: {}\n\
+                Backend: JLinkExe\n\n\
+                Data:\n{}",
+                args.session_id, address, data.len(), args.format, formatted_data
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -685,7 +891,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Write memory to the target")]
     async fn write_memory(&self, Parameters(args): Parameters<WriteMemoryArgs>) -> Result<CallToolResult, McpError> {
         debug!("Writing memory for session: {} at address {}", args.session_id, args.address);
-        
+
         // Parse address
         let address = match parse_address(&args.address) {
             Ok(addr) => addr,
@@ -715,9 +921,24 @@ impl EmbeddedDebuggerToolHandler {
             }
         };
 
-        // Write memory
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            jlink.write_memory(address, &data).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✏️ Memory write completed successfully!\n\n\
+                Session ID: {}\n\
+                Address: 0x{:08X}\n\
+                Bytes written: {}\n\
+                Backend: JLinkExe\n",
+                args.session_id, address, data.len()
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -779,7 +1000,7 @@ impl EmbeddedDebuggerToolHandler {
 
         // Set breakpoint
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -836,7 +1057,7 @@ impl EmbeddedDebuggerToolHandler {
 
         // Clear breakpoint
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -919,7 +1140,7 @@ impl EmbeddedDebuggerToolHandler {
         // Attach RTT
         {
             let mut rtt_manager = session_arc.rtt_manager.lock().await;
-            match rtt_manager.attach(session_arc.session.clone(), control_block_address, memory_ranges).await {
+            match rtt_manager.attach(session_arc.require_probe_rs()?.clone(), control_block_address, memory_ranges).await {
                 Ok(_) => {
                     let up_channels = rtt_manager.up_channel_count();
                     let down_channels = rtt_manager.down_channel_count();
@@ -1239,7 +1460,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Erase flash memory sectors or entire chip")]
     async fn flash_erase(&self, Parameters(args): Parameters<FlashEraseArgs>) -> Result<CallToolResult, McpError> {
         debug!("Flash erase for session: {}, type: {}", args.session_id, args.erase_type);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -1250,6 +1471,20 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            jlink.flash_erase().await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Flash erase completed!\n\n\
+                Session ID: {}\n\
+                Erase Type: {}\n\
+                Backend: JLinkExe\n",
+                args.session_id, args.erase_type
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
 
         // Parse erase type and parameters
         let erase_type = match args.erase_type.as_str() {
@@ -1270,7 +1505,7 @@ impl EmbeddedDebuggerToolHandler {
 
         // Perform erase operation
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             match crate::flash::FlashManager::erase_flash(&mut session, erase_type).await {
                 Ok(result) => {
                     let message = format!(
@@ -1313,7 +1548,7 @@ impl EmbeddedDebuggerToolHandler {
     #[tool(description = "Program file to flash memory (supports ELF, HEX, BIN)")]
     async fn flash_program(&self, Parameters(args): Parameters<FlashProgramArgs>) -> Result<CallToolResult, McpError> {
         debug!("Flash program for session: {}, file: {}", args.session_id, args.file_path);
-        
+
         let session_arc = {
             let sessions = self.sessions.read().await;
             match sessions.get(&args.session_id) {
@@ -1324,6 +1559,27 @@ impl EmbeddedDebuggerToolHandler {
                 }
             }
         };
+
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let base_addr = if let Some(addr_str) = &args.base_address {
+                Some(parse_address(addr_str).map_err(|e| McpError::internal_error(e, None))?)
+            } else {
+                None
+            };
+            let (address, size) = jlink.flash_program(&args.file_path, base_addr).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Flash programming completed!\n\n\
+                Session ID: {}\n\
+                File: {}\n\
+                Address: 0x{:08X}\n\
+                Bytes programmed: {}\n\
+                Backend: JLinkExe\n",
+                args.session_id, args.file_path, address, size
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
 
         // Parse file path and format
         let file_path = std::path::Path::new(&args.file_path);
@@ -1344,7 +1600,7 @@ impl EmbeddedDebuggerToolHandler {
 
         // Perform programming operation
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             match crate::flash::FlashManager::program_file(&mut session, file_path, format, base_address).await {
                 Ok(result) => {
                     let message = format!(
@@ -1433,7 +1689,7 @@ impl EmbeddedDebuggerToolHandler {
 
         // Perform verification
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             match crate::flash::FlashManager::verify_flash(&mut session, expected_data, address).await {
                 Ok(result) => {
                     let message = if result.success {
@@ -1509,7 +1765,7 @@ impl EmbeddedDebuggerToolHandler {
         // Step 1: Erase flash
         status_messages.push("🔄 Step 1/5: Erasing flash memory...".to_string());
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             match crate::flash::FlashManager::erase_flash(&mut session, crate::flash::EraseType::All).await {
                 Ok(_) => status_messages.push("✅ Flash erased successfully".to_string()),
                 Err(e) => {
@@ -1531,7 +1787,7 @@ impl EmbeddedDebuggerToolHandler {
         };
 
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             match crate::flash::FlashManager::program_file(&mut session, std::path::Path::new(&args.file_path), format, None).await {
                 Ok(result) => status_messages.push(format!("✅ Programmed {} bytes", result.bytes_programmed)),
                 Err(e) => {
@@ -1546,7 +1802,7 @@ impl EmbeddedDebuggerToolHandler {
         if args.reset_after_flash {
             status_messages.push("🔄 Step 3/5: Resetting target...".to_string());
             {
-                let mut session = session_arc.session.lock().await;
+                let mut session = session_arc.require_probe_rs()?.lock().await;
                 let mut core = match session.core(0) {
                     Ok(core) => core,
                     Err(e) => return Err(McpError::internal_error(format!("Failed to get core: {}", e), None)),
@@ -1602,12 +1858,12 @@ impl EmbeddedDebuggerToolHandler {
                     1..=2 => {
                         // First 2 attempts: ELF symbol detection (probe-rs priority method)
                         debug!("RTT attempt {}: Using ELF symbol detection (probe-rs style)", attempt);
-                        rtt_manager.attach_with_elf(session_arc.session.clone(), std::path::Path::new(&args.file_path)).await
+                        rtt_manager.attach_with_elf(session_arc.require_probe_rs()?.clone(), std::path::Path::new(&args.file_path)).await
                     }
                     3..=5 => {
                         // Attempts 3-5: standard attach, let probe-rs auto-scan memory
                         debug!("RTT attempt {}: Using standard memory map scan", attempt);
-                        rtt_manager.attach(session_arc.session.clone(), None, None).await
+                        rtt_manager.attach(session_arc.require_probe_rs()?.clone(), None, None).await
                     }
                     6..=7 => {
                         // Attempts 6-7: try STM32G4 specific memory ranges
@@ -1617,13 +1873,13 @@ impl EmbeddedDebuggerToolHandler {
                             (0x20004000, 0x20008000), // SRAM1 second half: 16KB
                             (0x20008000, 0x2000A000), // SRAM2: 8KB
                         ];
-                        rtt_manager.attach(session_arc.session.clone(), None, Some(stm32g4_ranges)).await
+                        rtt_manager.attach(session_arc.require_probe_rs()?.clone(), None, Some(stm32g4_ranges)).await
                     }
                     _ => {
                         // Last attempt: try common RTT control block addresses
                         let cb_addr = 0x20000000;
                         debug!("RTT attempt {}: Using specific control block address 0x{:08X}", attempt, cb_addr);
-                        rtt_manager.attach(session_arc.session.clone(), Some(cb_addr), None).await
+                        rtt_manager.attach(session_arc.require_probe_rs()?.clone(), Some(cb_addr), None).await
                     }
                 };
                 
@@ -1706,7 +1962,7 @@ impl EmbeddedDebuggerToolHandler {
         // Step 1: Flash the firmware
         info!("validate_boot: Flashing firmware {}", args.file_path);
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             if let Err(e) = crate::flash::FlashManager::program_file(
                 &mut session,
                 std::path::Path::new(&args.file_path),
@@ -1724,7 +1980,7 @@ impl EmbeddedDebuggerToolHandler {
         // Step 2: Reset and run (don't halt)
         info!("validate_boot: Resetting target");
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = session.core(0).map_err(|e|
                 McpError::internal_error(format!("Failed to get core: {}", e), None)
             )?;
@@ -1743,10 +1999,10 @@ impl EmbeddedDebuggerToolHandler {
         // Attach RTT
         {
             let mut rtt_manager = session_arc.rtt_manager.lock().await;
-            if let Err(e) = rtt_manager.attach(session_arc.session.clone(), None, None).await {
+            if let Err(e) = rtt_manager.attach(session_arc.require_probe_rs()?.clone(), None, None).await {
                 // Try with ELF symbols
                 if let Err(e2) = rtt_manager.attach_with_elf(
-                    session_arc.session.clone(),
+                    session_arc.require_probe_rs()?.clone(),
                     std::path::Path::new(&args.file_path)
                 ).await {
                     errors.push(format!("RTT attach failed: {} / {}", e, e2));
@@ -2303,8 +2559,23 @@ except Exception as e:
             }
         };
 
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            let regs = jlink.read_registers().await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let mut result = String::from("CPU Registers:\n\n");
+            let mut sorted_regs: Vec<_> = regs.iter().collect();
+            sorted_regs.sort_by_key(|(k, _)| k.to_string());
+            for (name, value) in &sorted_regs {
+                result.push_str(&format!("{:<12} 0x{:08X}\n", format!("{}:", name), value));
+            }
+            result.push_str(&format!("\nBackend: JLinkExe\n"));
+            return Ok(CallToolResult::success(vec![Content::text(result)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -2368,8 +2639,23 @@ except Exception as e:
             }
         };
 
+        // JLink backend dispatch
+        if let Some(jlink) = session_arc.jlink() {
+            jlink.write_register(&args.register, value as u64).await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let message = format!(
+                "✅ Register written successfully!\n\n\
+                Register: {}\n\
+                Value: 0x{:08X}\n\
+                Backend: JLinkExe\n",
+                args.register, value
+            );
+            return Ok(CallToolResult::success(vec![Content::text(message)]));
+        }
+
+        // probe-rs backend
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -2491,7 +2777,7 @@ except Exception as e:
         };
 
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -2646,7 +2932,7 @@ except Exception as e:
         };
 
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -2718,7 +3004,7 @@ except Exception as e:
         };
 
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             let mut core = match session.core(0) {
                 Ok(core) => core,
                 Err(e) => {
@@ -2754,7 +3040,7 @@ except Exception as e:
         };
 
         {
-            let mut session = session_arc.session.lock().await;
+            let mut session = session_arc.require_probe_rs()?.lock().await;
             // Get memory map before borrowing core (avoids borrow conflict)
             let memory_map = session.target().memory_map.clone();
 

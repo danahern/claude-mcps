@@ -1,20 +1,10 @@
 # alif-flash
 
-Alif Ensemble flash MCP server — supports E7 and E8 boards via `device` parameter. Three methods: SE-UART ISP, J-Link loadbin, and RTT OSPI programmer.
+Alif Ensemble flash MCP server — supports E7 and E8 boards via `device` parameter.
 
-## CRITICAL: Use the fastest available method
+## CRITICAL: Flash methods are under systematic re-validation
 
-| Method | Speed | Use case |
-|--------|-------|----------|
-| `jlink_flash` | ~44 KB/s (MRAM), ~7 KB/s (OSPI) | **MRAM + OSPI images — preferred** |
-| `flash` (SE-UART) | ~5 KB/s | Initial ATOC setup only |
-| `ospi_program` (RTT) | **BROKEN** | Do not use — see below |
-
-For OSPI images: use `jlink_flash()` (requires M55_HP debug stub in ATOC).
-For MRAM images: use `jlink_flash()`.
-For initial ATOC setup: use SE-UART `flash()`.
-
-**`ospi_program` is broken:** M55_HP CPU cannot access the OSPI controller (BusFault due to EXPMST bridge not forwarding 0x8xxx_xxxx addresses). The firmware loads and RTT connects, but flash operations hang. See knowledge item k-c3cbe077.
+**All previous claims about which method works, persistence, speed, etc. have been deprecated.** See `plans/alif-flash-reset.md` for the systematic test plan. Do not make assumptions about flash behavior until tests are complete.
 
 ## Setup
 
@@ -26,70 +16,40 @@ Requires PRG_USB cable connected to Alif E7 or E8 board.
 
 ## Tools
 
-### RTT OSPI Programmer (BROKEN — do not use)
-- `ospi_program(config?, image?, address?, verify?)` — **BROKEN:** M55_HP BusFault on OSPI access
-
 ### SE-UART (ISP protocol)
 - `list_ports()` — List available serial ports
 - `probe(port?)` — Check if SE-UART is responsive
 - `maintenance(port?)` — Enter maintenance mode
 - `gen_toc(config)` — Generate ATOC package from JSON config
-- `flash(config, port?, maintenance?)` — Write all images via SE-UART (~5 KB/s)
+- `flash(config, port?, maintenance?)` — Write all images via SE-UART
 - `monitor(port?, baud?, duration?)` — Read serial console output
 
 ### J-Link (direct loadbin)
 - `jlink_setup(install?)` — Check or install J-Link device definition
-- `jlink_flash(image_dir?, config?, components?, verify?)` — Flash via J-Link (~44 KB/s)
+- `jlink_flash(image_dir?, config?, components?, verify?)` — Flash via J-Link
 
-## Typical Workflows
+### RTT OSPI Programmer
+- `ospi_program(config?, image?, address?, verify?)` — Status unknown, needs re-testing
 
-### ~~OSPI flash via RTT~~ (BROKEN — M55_HP BusFault on OSPI controller access)
+## Official Workflow (from AUGD0022)
 
-Do not use. M55_HP cannot access the OSPI controller due to EXPMST bridge configuration.
-Use J-Link FLM workflow below instead.
+The official Alif flash workflow is:
+1. `app-gen-toc -f config.json` → generates AppTocPackage.bin
+2. `sudo ./app-write-mram -p` → writes ATOC to MRAM via SE-UART ISP
+3. Power cycle → SE processes ATOC and boots configured cores
 
-### MRAM-only (J-Link)
-```
-1. alif-flash.jlink_setup(install=true)
-2. alif-flash.jlink_flash(config="/path/to/linux-boot-e7.json", verify=true)
-   # Power cycle board after flash
-```
+Our MCP wraps steps 1-2 as `gen_toc()` + `flash()`.
 
-### OSPI flash via J-Link FLM (preferred for OSPI)
-
-**Step 1 — One-time ATOC setup with debug stub:**
-```
-1. alif-flash.gen_toc(config="build/config/linux-boot-e7-ospi.json")
-2. alif-flash.maintenance()
-3. alif-flash.flash(config="linux-boot-e7-ospi.json")
-   # Power cycle board
-```
-
-**Step 2 — OSPI programming via J-Link FLM (~7 KB/s):**
-```
-1. alif-flash.jlink_setup(install=true)
-2. alif-flash.jlink_flash(config="/path/to/linux-boot-e7-ospi-jlink.json", verify=true)
-   # Power cycle board after flash
-```
-
-### SE-UART (fallback — reliable)
-```
-1. alif-flash.probe()
-2. alif-flash.maintenance()
-3. alif-flash.gen_toc(config="build/config/linux-boot-e7.json")
-4. alif-flash.flash(config="/path/to/linux-boot-e7.json")
-```
+**Key detail:** The official docs use `-p` flag (16-byte alignment padding) on `app-write-mram`. Verify our MCP passes this.
 
 ## Key Details
 
-- RTT: **BROKEN** — M55_HP BusFault on OSPI controller access (EXPMST bridge issue). Do not use.
-- J-Link: ~44 KB/s (MRAM), ~7 KB/s (OSPI via FLM). Requires freshly power-cycled board. **Preferred for OSPI.**
-- SE-UART: ~5 KB/s via ISP protocol. 240-byte chunks, 2-byte LE sequence numbers.
 - All tools accept optional `device` parameter: `"alif-e7"` (default) or `"alif-e8"`
-- MRAM addresses (E7): TF-A@0x80002000, DTB@0x80010000, kernel@0x80020000, rootfs@0x80300000
+- MRAM addresses (E7): TF-A@0x80002000, DTB@0x80010000, kernel@0x80020000, rootfs@0x80380000
 - MRAM addresses (E8): same except rootfs@0x80380000
 - OSPI addresses: rootfs@0xC0000000, kernel@0xC0800000 (IS25WX256 NOR flash)
-- After flash: power cycle (unplug/replug PRG_USB) required for A32 boot
+- ISP baud rate: 57600 (AUGD0005 p.19)
+- Console baud rate: 115200
 
 ## Testing
 

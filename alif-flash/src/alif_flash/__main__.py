@@ -43,8 +43,11 @@ async def _run():
     server = create_server(setools_dir=args.setools_dir)
     init_options = server.create_initialization_options()
 
+    import os
+
+    resolved = os.path.abspath(args.setools_dir) if args.setools_dir else "(not set)"
     async with stdio_server() as (read_stream, write_stream):
-        logger.info("Alif Ensemble Flash MCP server starting")
+        logger.info("Alif Ensemble Flash MCP server starting — setools_dir: %s", resolved)
         await server.run(read_stream, write_stream, init_options)
 
 
