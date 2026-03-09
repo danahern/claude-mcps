@@ -28,6 +28,9 @@ Requires PRG_USB cable connected to Alif E7 or E8 board.
 - `jlink_setup(install?)` — Check or install J-Link device definition
 - `jlink_flash(image_dir?, config?, components?, verify?)` — Flash via J-Link
 
+### USB OSPI Programmer (XMODEM)
+- `ospi_program_usb(image, device?, timeout?)` — Program OSPI via USB CDC-ACM XMODEM transfer. Auto-detects Alif CDC-ACM (VID 0x0525). Four timeout layers: receiver ready (30s), per-block ACK (10s), post-EOT completion (30s), overall (auto from file size). ~47 KB/s.
+
 ### RTT OSPI Programmer
 - `ospi_program(config?, image?, address?, verify?)` — Status unknown, needs re-testing
 
@@ -57,4 +60,4 @@ Our MCP wraps steps 1-2 as `gen_toc()` + `flash()`.
 python3 -m pytest tests/ -v
 ```
 
-107 tests: ISP protocol (18) + J-Link (38) + OSPI RTT (37) + Device registry (14).
+169 tests: ISP protocol (23) + J-Link (45) + OSPI RTT (37) + Device registry (17) + XMODEM (47).

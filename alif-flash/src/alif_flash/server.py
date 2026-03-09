@@ -228,6 +228,35 @@ TOOLS = [
         },
     ),
     Tool(
+        name="ospi_program_usb",
+        description=(
+            "Program OSPI flash via USB CDC-ACM XMODEM transfer. "
+            "Auto-detects Alif CDC-ACM device (VID 0x0525), sends binary via "
+            "XMODEM-CRC (128-byte blocks), and waits for flasher confirmation. "
+            "Four timeout layers: receiver ready (30s), per-block ACK (10s), "
+            "post-EOT completion (30s), overall wall clock (auto-calculated "
+            "from file size as (size/30KB)*2)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "image": {
+                    "type": "string",
+                    "description": "Path to binary image file (e.g., combined OSPI image)",
+                },
+                "device": {
+                    "type": "string",
+                    "description": "Serial device path (e.g., /dev/cu.usbmodem12001). Auto-detected if omitted.",
+                },
+                "timeout": {
+                    "type": "number",
+                    "description": "Max transfer time in seconds. Default: auto-calculated from file size.",
+                },
+            },
+            "required": ["image"],
+        },
+    ),
+    Tool(
         name="monitor",
         description="Read serial console output at a given baud rate. Use jlink_reset=true to trigger a JLink NSRST reset and capture SE boot output (e.g. to check for '[SES] No ATOC' or boot success). Can also wait for a board power cycle (unplug/replug) to capture boot output from the start.",
         inputSchema={
@@ -318,6 +347,21 @@ def _ospi_program_single(data: bytes, addr: int, verify: bool,
         except Exception:
             pass
         jlink.close()
+
+
+def _ospi_program_usb(image: str, device: str,
+                      timeout_override: float | None = None) -> dict:
+    """Run XMODEM transfer over USB CDC-ACM. Called from thread."""
+    from . import xmodem
+    import serial as _serial
+
+    port = _serial.Serial(device, 115200, timeout=1)
+    try:
+        result = xmodem.xmodem_send(port, image)
+        result["device"] = device
+        return result
+    finally:
+        port.close()
 
 
 def create_server(setools_dir: str | None = None) -> Server:
@@ -448,6 +492,26 @@ async def _dispatch(name: str, args: dict, setools_dir: str | None) -> list[Text
                     device=device)
             else:
                 return _text("Error: provide 'config' or both 'image' and 'address'")
+            return _json(result)
+
+        case "ospi_program_usb":
+            from . import xmodem
+            image = args.get("image", "")
+            if not image:
+                return _text("Error: 'image' parameter is required")
+            if not os.path.isfile(image):
+                return _text(f"Error: file not found: {image}")
+            usb_device = args.get("device", "")
+            if not usb_device:
+                usb_device = xmodem.find_cdc_device()
+                if not usb_device:
+                    return _text(
+                        "Error: No Alif CDC-ACM device found — "
+                        "is programming mode ATOC flashed and J2 connected?"
+                    )
+            timeout_override = args.get("timeout")
+            result = await asyncio.to_thread(
+                _ospi_program_usb, image, usb_device, timeout_override)
             return _json(result)
 
         case "monitor":
