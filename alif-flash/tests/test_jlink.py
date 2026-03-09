@@ -192,7 +192,7 @@ class TestFlashFromConfig:
     """Tests for flash_from_config config parsing and generic key handling."""
 
     def _make_config_dir(self, tmp, config_data):
-        """Create a config dir structure: tmp/config/<name>.json + tmp/images/."""
+        """Create a config dir structure: tmp/config/<name>.json + tmp/images/ + tmp/AppTocPackage.bin."""
         config_dir = os.path.join(tmp, "config")
         images_dir = os.path.join(tmp, "images")
         os.makedirs(config_dir, exist_ok=True)
@@ -200,6 +200,10 @@ class TestFlashFromConfig:
         config_path = os.path.join(config_dir, "test.json")
         with open(config_path, "w") as f:
             json.dump(config_data, f)
+        # flash_from_config needs AppTocPackage.bin in the build dir (parent of config/)
+        atoc_path = os.path.join(tmp, "AppTocPackage.bin")
+        with open(atoc_path, "wb") as f:
+            f.write(b'\x00' * 1024)
         return config_path, images_dir
 
     @patch("alif_flash.jlink.flash_images")
@@ -294,7 +298,8 @@ class TestFlashFromConfig:
             flash_from_config(config_path)
             components = mock_flash.call_args[0][1]
             assert "device" not in components
-            assert len(components) == 1
+            # 3 = atoc_erase + atoc + tfa (DEVICE key excluded)
+            assert len(components) == 3
 
     def test_empty_config_returns_error(self):
         """Config with no valid image entries returns error."""
@@ -385,7 +390,8 @@ class TestFlashFromConfig:
             config_path, _ = self._make_config_dir(tmp, config)
             flash_from_config(config_path)
             components = mock_flash.call_args[0][1]
-            assert len(components) == 4
+            # 6 = atoc_erase + atoc + tfa + dtb + kernel + rootfs
+            assert len(components) == 6
             assert "tfa" in components
             assert "dtb" in components
             assert "kernel" in components
@@ -509,42 +515,50 @@ class TestAtocWarnings:
         warnings = _atoc_warnings(layout)
         assert len(warnings) == 0
 
+    @staticmethod
+    def _make_config_dir(tmp, config_data):
+        config_dir = os.path.join(tmp, "config")
+        images_dir = os.path.join(tmp, "images")
+        os.makedirs(config_dir, exist_ok=True)
+        os.makedirs(images_dir, exist_ok=True)
+        config_path = os.path.join(config_dir, "test.json")
+        with open(config_path, "w") as f:
+            json.dump(config_data, f)
+        with open(os.path.join(tmp, "AppTocPackage.bin"), "wb") as f:
+            f.write(b'\x00' * 1024)
+        return config_path, images_dir
+
     @patch("alif_flash.jlink.flash_images")
-    def test_flash_from_config_warns_atoc_mram(self, mock_flash):
-        """flash_from_config result includes ATOC warnings for MRAM addresses."""
+    def test_flash_from_config_writes_atoc(self, mock_flash):
+        """flash_from_config writes ATOC and reports address in result."""
         mock_flash.return_value = {"success": True}
         with tempfile.TemporaryDirectory() as tmp:
             config = {
                 "TFA": {"binary": "bl32.bin", "mramAddress": "0x80002000"},
             }
-            config_dir = os.path.join(tmp, "config")
-            images_dir = os.path.join(tmp, "images")
-            os.makedirs(config_dir, exist_ok=True)
-            os.makedirs(images_dir, exist_ok=True)
-            config_path = os.path.join(config_dir, "test.json")
-            with open(config_path, "w") as f:
-                json.dump(config, f)
+            config_path, _ = self._make_config_dir(tmp, config)
             result = flash_from_config(config_path)
-            # flash_images was mocked, so warnings come from flash_images
-            # which is called with the MRAM layout
+            # ATOC info should be in result (no warnings since we wrote it)
+            assert "atoc" in result
+            assert result["atoc"]["size"] == 1024
+            assert "warnings" not in result
+            # Layout should include atoc_erase and atoc entries
             layout = mock_flash.call_args.kwargs.get("layout", {})
-            assert layout["tfa"]["addr"] == 0x80002000
+            assert "atoc_erase" in layout
+            assert "atoc" in layout
+            assert "tfa" in layout
 
     @patch("alif_flash.jlink.flash_images")
-    def test_flash_from_config_warns_atoc_ospi(self, mock_flash):
-        """flash_from_config result includes ATOC warnings for OSPI addresses."""
+    def test_flash_from_config_atoc_address(self, mock_flash):
+        """flash_from_config calculates ATOC address as system_mram_base - size."""
         mock_flash.return_value = {"success": True}
         with tempfile.TemporaryDirectory() as tmp:
             config = {
                 "ROOTFS": {"binary": "rootfs.img", "ospiAddress": "0xC0000000"},
             }
-            config_dir = os.path.join(tmp, "config")
-            images_dir = os.path.join(tmp, "images")
-            os.makedirs(config_dir, exist_ok=True)
-            os.makedirs(images_dir, exist_ok=True)
-            config_path = os.path.join(config_dir, "test.json")
-            with open(config_path, "w") as f:
-                json.dump(config, f)
+            config_path, _ = self._make_config_dir(tmp, config)
             result = flash_from_config(config_path)
+            # system_mram_base=0x80580000, atoc_size=1024 → addr=0x8057FC00
+            assert result["atoc"]["address"] == "0x8057FC00"
             layout = mock_flash.call_args.kwargs.get("layout", {})
-            assert layout["rootfs"]["addr"] == 0xC0000000
+            assert layout["atoc"]["addr"] == 0x80580000 - 1024

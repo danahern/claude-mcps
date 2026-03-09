@@ -393,7 +393,12 @@ def flash_images(image_dir: str, components: list[str] | None = None,
 
 def flash_from_config(config_path: str, verify: bool = False,
                       erase: bool = False, device: str | None = None) -> dict:
-    """Flash images defined in an ATOC JSON config via J-Link.
+    """Flash ATOC + images defined in an ATOC JSON config via J-Link.
+
+    Writes AppTocPackage.bin to MRAM (system_mram_base - atoc_size) first,
+    then all component images. This is the J-Link equivalent of the ISP
+    flash path — both ATOC and images are written so the SE boots the
+    correct configuration after reset.
 
     Reads the same JSON format as the SE-UART flash tool, extracting
     file names and MRAM addresses from each entry. Handles ANY config
@@ -403,6 +408,7 @@ def flash_from_config(config_path: str, verify: bool = False,
 
     cfg = devices.get_config(device)
     atoc_key_map = cfg["atoc_key_map"]
+    system_mram_base = cfg["system_mram_base"]
 
     with open(config_path) as f:
         config = json.load(f)
@@ -410,8 +416,34 @@ def flash_from_config(config_path: str, verify: bool = False,
     build_dir = os.path.normpath(os.path.join(os.path.dirname(config_path), ".."))
     images_dir = os.path.join(build_dir, "images")
 
-    # Build layout from config — process ALL keys generically
+    # ATOC — must be written first so SE knows what to boot after reset
+    atoc_path = os.path.join(build_dir, "AppTocPackage.bin")
+    if not os.path.exists(atoc_path):
+        return {"success": False,
+                "message": f"AppTocPackage.bin not found at {atoc_path} — run gen_toc first"}
+
+    atoc_size = os.path.getsize(atoc_path)
+    atoc_addr = system_mram_base - atoc_size
+    logger.info("ATOC: %d bytes -> 0x%08X (system_mram_base=0x%08X)",
+                atoc_size, atoc_addr, system_mram_base)
+
+    # Build layout: ATOC erase pad + ATOC + component images
     custom_layout = {}
+
+    # Erase stale ATOC data below the new address (different configs produce
+    # different-sized ATOCs — stale 'ccBS' magic confuses the SE scanner)
+    ATOC_ERASE_PAD = 8192
+    erase_addr = atoc_addr - ATOC_ERASE_PAD
+    erase_file = os.path.join(build_dir, ".atoc_erase.bin")
+    with open(erase_file, 'wb') as zf:
+        zf.write(b'\x00' * ATOC_ERASE_PAD)
+    custom_layout["atoc_erase"] = {"file": os.path.relpath(erase_file, images_dir), "addr": erase_addr}
+    logger.info("ATOC erase: %d bytes of zeros -> 0x%08X", ATOC_ERASE_PAD, erase_addr)
+
+    # ATOC package itself
+    custom_layout["atoc"] = {"file": os.path.relpath(atoc_path, images_dir), "addr": atoc_addr}
+
+    # Component images from config — process ALL keys generically
     for key, entry in config.items():
         if key == "DEVICE" or not isinstance(entry, dict):
             continue
@@ -424,8 +456,20 @@ def flash_from_config(config_path: str, verify: bool = False,
             comp = atoc_key_map.get(key, key.lower())
             custom_layout[comp] = {"file": binary, "addr": addr}
 
-    if not custom_layout:
+    if len(custom_layout) <= 2:  # only erase + atoc, no actual images
         return {"success": False, "message": "No images found in config"}
 
     components = list(custom_layout.keys())
-    return flash_images(images_dir, components, verify, erase, layout=custom_layout)
+    result = flash_images(images_dir, components, verify, erase, layout=custom_layout,
+                          device=device)
+
+    # Clean up temp erase file
+    if os.path.exists(erase_file):
+        os.unlink(erase_file)
+
+    # Replace stale ATOC warnings — we wrote the ATOC, so MRAM writes ARE persistent
+    if result.get("warnings"):
+        result.pop("warnings")
+    result["atoc"] = {"address": f"0x{atoc_addr:08X}", "size": atoc_size}
+
+    return result
