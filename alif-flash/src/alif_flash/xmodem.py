@@ -53,28 +53,30 @@ def crc16_ccitt(data: bytes) -> int:
 def _get_usb_vendor_ids() -> dict[str, int]:
     """Parse ioreg on macOS to map USB modem device names to vendor IDs.
 
-    Returns dict mapping device basename (e.g., 'usbmodem12001') to VID.
+    Returns dict mapping device path (e.g., '/dev/cu.usbmodem12001') to VID.
+    Uses full ioreg tree traversal since IOCalloutDevice is deeply nested
+    under the IOUSBHostDevice that carries idVendor.
     """
     vendor_map = {}
     try:
         output = subprocess.check_output(
-            ["ioreg", "-r", "-c", "IOUSBHostDevice", "-l"],
-            text=True, timeout=5,
+            ["ioreg", "-l"],
+            text=True, timeout=10,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
         return vendor_map
 
-    # Parse ioreg output: look for idVendor and IODialinDevice pairs
-    # within the same device block
+    # Track the most recent idVendor seen at each nesting depth.
+    # IOCalloutDevice inherits the VID from its ancestor IOUSBHostDevice.
     current_vid = None
     for line in output.splitlines():
         vid_match = re.search(r'"idVendor"\s*=\s*(\d+)', line)
         if vid_match:
             current_vid = int(vid_match.group(1))
-        dialin_match = re.search(r'"IODialinDevice"\s*=\s*"(/dev/cu\.\w+)"', line)
-        if dialin_match and current_vid is not None:
-            device_path = dialin_match.group(1)
-            vendor_map[device_path] = current_vid
+        callout_match = re.search(
+            r'"IOCalloutDevice"\s*=\s*"(/dev/cu\.usbmodem\w+)"', line)
+        if callout_match and current_vid is not None:
+            vendor_map[callout_match.group(1)] = current_vid
 
     return vendor_map
 
