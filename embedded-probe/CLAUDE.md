@@ -1,6 +1,31 @@
 # embedded-probe
 
-Embedded debugging and flash programming MCP server via probe-rs. Supports ARM Cortex-M, RISC-V, and Xtensa targets through J-Link, ST-Link, CMSIS-DAP, and ESP-USB-JTAG probes.
+Embedded debugging and flash programming MCP server. Primary backend: probe-rs (ARM Cortex-M, RISC-V, Xtensa via J-Link, ST-Link, CMSIS-DAP, ESP-USB-JTAG). Secondary backend: JLinkExe subprocess — auto-activates when probe-rs rejects a chip, covering any target in Segger's device DB including Cortex-A32.
+
+## JLink Auto-Fallback Backend
+
+When `connect()` is called with a J-Link probe and probe-rs fails to attach (e.g., for unsupported chips like Cortex-A32), the MCP **automatically retries using JLinkExe as a subprocess backend**. The `target_chip` argument is passed directly to JLinkExe as the device name. No custom YAML, no workaround — just call `connect()`.
+
+**Operations available via JLink backend:**
+- `halt`, `run`, `reset`, `step`, `get_status`
+- `read_memory`, `write_memory`
+- `read_registers`, `write_register`
+- `flash_erase`, `flash_program` (uses JLink `loadbin`/`loadfile`)
+
+**Not available via JLink backend:** RTT, breakpoints, watchpoints, `core_dump`, `stack_trace`, `analyze_coredump`
+
+**Alif E7/E8 Cortex-A32 chip names (use with `connect()`):**
+| Chip name | Core | Use |
+|-----------|------|-----|
+| `"Cortex-A32"` | Generic | Recommended for memory reads (JTAG, read-only after SE boot) |
+| `"AE722F80F55D5_A32_0"` | E7 core 0 | More specific, same read-only constraint |
+| `"AE722F80F55D5_A32_1"` | E7 core 1 | |
+| `"AE822FA0E5597_A32_0"` | E8 core 0 | |
+| `"AE822FA0E5597_A32_1"` | E8 core 1 | |
+
+**CRITICAL**: Cortex-A32 MRAM is write-protected after SE boot. Use `read_memory`/`read_registers` only — do not attempt flash operations via the A32 core.
+
+**CRITICAL**: Always call `list_targets` before `connect` — it lists known chip names including Alif A32 targets with their probe type and notes.
 
 ## Build
 

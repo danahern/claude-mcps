@@ -35,7 +35,7 @@ DEVICES = {
         },
     },
     "alif-e8": {
-        "jlink_device": "AE822FA0E5597LS0_M55_HP",
+        "jlink_device": "AE822FA0E5597LS0_M55_HE",
         "jlink_device_reset": "AE822FA0E5597LS0_A32_0",
         "isp_baud": 57600,
         "part_number": "AE822FA0E5597",
@@ -47,7 +47,7 @@ DEVICES = {
         },
         "atoc_key_map": {"TFA": "tfa", "DTB": "dtb", "KERNEL": "kernel", "ROOTFS": "rootfs"},
         "system_mram_base": 0x80580000,
-        "jlink_script": "AlifE7.JLinkScript",  # same TF-A platform (devkit_e7)
+        "jlink_script": "AlifE8_HE.JLinkScript",  # M55_HE AHB-AP bypasses A32 cache
         "global_cfg": {
             "DEVICE": {
                 "Revision": "A0",
