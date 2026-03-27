@@ -230,11 +230,46 @@ impl ZephyrBuildToolHandler {
         None
     }
 
+    /// Create a `west` Command for the given workspace.
+    /// In Docker mode: wraps as `docker exec -i <container> west`.
+    /// In host mode: sets SDK env vars if not already present.
+    fn west_cmd(&self, workspace: &Path) -> Command {
+        if self.config.docker {
+            let mut cmd = Command::new("docker");
+            cmd.args(["exec", "-i", &self.config.docker_container, "west"])
+               .current_dir(workspace);
+            cmd
+        } else {
+            let mut cmd = Command::new("west");
+            cmd.current_dir(workspace);
+            // Set SDK env vars for host mode
+            if std::env::var("ZEPHYR_TOOLCHAIN_VARIANT").is_err() {
+                let sdk = self.config.sdk_path.clone()
+                    .or_else(Self::find_zephyr_sdk);
+                if let Some(sdk_path) = sdk {
+                    cmd.env("ZEPHYR_TOOLCHAIN_VARIANT", "zephyr");
+                    cmd.env("ZEPHYR_SDK_INSTALL_DIR", &sdk_path);
+                    cmd.env("ZEPHYR_BASE", workspace.join("zephyr"));
+                }
+            }
+            cmd
+        }
+    }
+
     /// Create a twister Command with Zephyr SDK environment set.
+    /// In Docker mode: wraps as `docker exec -i <container> python3`.
     /// Strips pyenv shims from PATH to prevent stderr noise that corrupts
     /// cmake's JSON output (pyenv shim emits warnings that cmake merges
     /// into stdout via stderr=subprocess.STDOUT in verify-toolchain.cmake).
-    fn twister_command(workspace: &Path, cmd_args: &[String]) -> Command {
+    fn twister_command(&self, workspace: &Path, cmd_args: &[String]) -> Command {
+        if self.config.docker {
+            let mut cmd = Command::new("docker");
+            cmd.args(["exec", "-i", &self.config.docker_container, "python3"])
+               .args(cmd_args)
+               .current_dir(workspace);
+            return cmd;
+        }
+
         let mut cmd = Command::new("python3");
         cmd.args(cmd_args).current_dir(workspace);
 
@@ -249,7 +284,9 @@ impl ZephyrBuildToolHandler {
 
         // Set SDK env vars if not already in environment
         if std::env::var("ZEPHYR_TOOLCHAIN_VARIANT").is_err() {
-            if let Some(sdk_path) = Self::find_zephyr_sdk() {
+            let sdk = self.config.sdk_path.clone()
+                .or_else(Self::find_zephyr_sdk);
+            if let Some(sdk_path) = sdk {
                 cmd.env("ZEPHYR_TOOLCHAIN_VARIANT", "zephyr");
                 cmd.env("ZEPHYR_SDK_INSTALL_DIR", &sdk_path);
                 cmd.env("ZEPHYR_BASE", workspace.join("zephyr"));
@@ -503,9 +540,8 @@ impl ZephyrBuildToolHandler {
         // If include_all is set, run west boards to get full list
         if args.include_all {
             if let Ok(workspace) = self.find_workspace(None) {
-                let output = Command::new("west")
+                let output = self.west_cmd(&workspace)
                     .args(["boards"])
-                    .current_dir(&workspace)
                     .output()
                     .await;
 
@@ -599,13 +635,25 @@ impl ZephyrBuildToolHandler {
             let build_dir_clone = build_dir.clone();
             let app_path_clone = app_path.clone();
 
+            let docker = self.config.docker;
+            let docker_container = self.config.docker_container.clone();
+
             tokio::spawn(async move {
                 let start = Instant::now();
-                let output = Command::new("west")
-                    .args(&cmd_args)
-                    .current_dir(&workspace_clone)
-                    .output()
-                    .await;
+                let output = if docker {
+                    Command::new("docker")
+                        .args(["exec", "-i", &docker_container, "west"])
+                        .args(&cmd_args)
+                        .current_dir(&workspace_clone)
+                        .output()
+                        .await
+                } else {
+                    Command::new("west")
+                        .args(&cmd_args)
+                        .current_dir(&workspace_clone)
+                        .output()
+                        .await
+                };
 
                 let mut builds = builds.write().await;
                 if let Some(state) = builds.get_mut(&build_id_clone) {
@@ -658,9 +706,8 @@ impl ZephyrBuildToolHandler {
 
         info!("Running: west {}", cmd_args.join(" "));
 
-        let output = Command::new("west")
+        let output = self.west_cmd(&workspace)
             .args(&cmd_args)
-            .current_dir(&workspace)
             .output()
             .await
             .map_err(|e| {
@@ -767,9 +814,8 @@ impl ZephyrBuildToolHandler {
             info!("Building {}: west {}", app_name, cmd_args.join(" "));
             let start = Instant::now();
 
-            let output = Command::new("west")
+            let output = self.west_cmd(&workspace)
                 .args(&cmd_args)
-                .current_dir(&workspace)
                 .output()
                 .await;
 
@@ -1218,12 +1264,25 @@ impl ZephyrBuildToolHandler {
 
             let tests = self.tests.clone();
             let test_id_clone = test_id.clone();
+            let docker = self.config.docker;
+            let docker_container = self.config.docker_container.clone();
 
             tokio::spawn(async move {
                 let start = Instant::now();
-                let output = ZephyrBuildToolHandler::twister_command(&workspace, &cmd_args)
-                    .output()
-                    .await;
+                let output = if docker {
+                    Command::new("docker")
+                        .args(["exec", "-i", &docker_container, "python3"])
+                        .args(&cmd_args)
+                        .current_dir(&workspace)
+                        .output()
+                        .await
+                } else {
+                    Command::new("python3")
+                        .args(&cmd_args)
+                        .current_dir(&workspace)
+                        .output()
+                        .await
+                };
 
                 let mut tests = tests.write().await;
                 if let Some(state) = tests.get_mut(&test_id_clone) {
@@ -1264,7 +1323,7 @@ impl ZephyrBuildToolHandler {
         let start = Instant::now();
         info!("Running: python3 {}", cmd_args.join(" "));
 
-        let output = Self::twister_command(&workspace, &cmd_args)
+        let output = self.twister_command(&workspace, &cmd_args)
             .output()
             .await
             .map_err(|e| {
